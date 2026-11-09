@@ -42,7 +42,7 @@ class HomrEngine:
                 ).stdout.strip()
             except (OSError, subprocess.SubprocessError):
                 v = "unknown"
-        return f"{v}+{commit[:12]}" if commit else v
+        return f"{v} ({commit[:12]})" if commit and commit[:7] not in v else v
 
     def ready(self) -> bool:
         return shutil.which(self.binary) is not None or Path(self.binary).exists()

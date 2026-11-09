@@ -63,8 +63,8 @@ def _staff_tokens(staff: m21.stream.Stream) -> tuple[list[Tok], int]:
         dur = round(float(el.quarterLength) * 12) / 12
         notes = list(el.notes) if isinstance(el, m21.chord.Chord) else [el]
         fingers = _fingers(el)
-        for n in notes:
-            fingers += _fingers(n)
+        if not fingers and len(notes) > 1:
+            fingers = [f for n in notes for f in _fingers(n)]
         nfing += len(fingers)
         for i, n in enumerate(notes):
             f = fingers[i] if len(fingers) == len(notes) else (fingers[0] if len(notes) == 1 and fingers else None)
@@ -207,6 +207,18 @@ def score(truth: Staves, pred: Staves) -> dict:
     if truth.fingerings:
         res["fingering_recall_on_matched_notes"] = round(finger_hits / finger_truth, 3) if finger_truth else 0.0
     return res
+
+
+def agreement(a: Staves, b: Staves) -> dict:
+    """Staff-by-staff pitch F1 between two readings with any number of staves."""
+    matched = total_a = total_b = 0
+    for k in range(max(len(a.staves), len(b.staves))):
+        sa = [t.pitch for t in a.staves[k]] if k < len(a.staves) else []
+        sb = [t.pitch for t in b.staves[k]] if k < len(b.staves) else []
+        matched += len(lcs_pairs(sa, sb))
+        total_a += len(sa)
+        total_b += len(sb)
+    return {"staves": [len(a.staves), len(b.staves)], "pitch_f1": round(f1(matched, total_a, total_b), 3)}
 
 
 def main() -> None:

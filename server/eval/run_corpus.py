@@ -131,8 +131,7 @@ def main() -> int:
                     row["staves"] = job["result"]["staff_count"]
                     row["measures"] = job["result"]["measure_count"]
                     if f != "scan.pdf" and "scan.pdf" in readings:
-                        agree = S.score(readings["scan.pdf"], readings[f])
-                        row["agreement_with_scan_pitch_f1"] = agree["pitch_f1"]
+                        row["agreement_with_scan_pitch_f1"] = S.agreement(readings["scan.pdf"], readings[f])["pitch_f1"]
                 rows.append(row)
                 print(json.dumps(row), flush=True)
 

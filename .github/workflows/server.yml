@@ -1,0 +1,35 @@
+name: server
+
+on:
+  push:
+    paths: ["server/**", ".github/workflows/server.yml"]
+  pull_request:
+    paths: ["server/**", ".github/workflows/server.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t rochan-piano-omr server/
+      - name: Smoke test
+        run: |
+          docker run -d --name omr -p 8000:8000 -e OMR_API_TOKEN=ci-token rochan-piano-omr
+          for i in $(seq 1 30); do curl -sf localhost:8000/healthz && break; sleep 2; done
+          curl -sf -H "Authorization: Bearer ci-token" \
+            -F file=@server/testdata/pieces/mutopia-bach-minuet-g/photo-hard.jpg \
+            "localhost:8000/v1/jobs?wait=30" | tee job.json
+          python3 -c "import json; j=json.load(open('job.json')); assert j['status'] in ('queued','running','succeeded'), j"

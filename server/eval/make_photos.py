@@ -41,7 +41,8 @@ def _curl(page: np.ndarray, amp: float) -> np.ndarray:
     return cv2.remap(page, mx, my + bulge + wave, cv2.INTER_LINEAR, borderValue=(255, 255, 255))
 
 
-def simulate(page_rgb: np.ndarray, level: str, seed: int) -> bytes:
+def simulate(page_rgb: np.ndarray, level: str, seed: int, corners_out: list | None = None) -> bytes:
+    """corners_out, if given, receives the page corners in the photo (TL, TR, BR, BL)."""
     rng = np.random.default_rng(seed)
     hard = level == "hard"
     page = page_rgb.astype(np.float32) * np.array([0.93, 0.92, 0.88], np.float32) + 6
@@ -63,6 +64,8 @@ def simulate(page_rgb: np.ndarray, level: str, seed: int) -> bytes:
     corners[0, 0] += k * pw
     corners[1, 0] -= k * pw
     corners += rng.normal(0, 18 if hard else 6, corners.shape)
+    if corners_out is not None:
+        corners_out.extend(corners.tolist())
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
     M = cv2.getPerspectiveTransform(src, np.float32(corners))
 
