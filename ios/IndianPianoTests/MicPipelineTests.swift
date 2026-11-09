@@ -48,6 +48,26 @@ final class MicPipelineTests: XCTestCase {
         XCTAssertFalse(results.contains { $0.chroma.map { ChromaAnalyzer.matches($0, expected: [2, 5, 9]) } ?? false })
     }
 
+    func testOnsetChromaIgnoresTheChordStillRinging() {
+        // C3-E3-G3 struck and left ringing; F#3 struck 0.6 s later over it.
+        let total = Int(1.6 * sampleRate)
+        let chord = [48, 52, 55].map {
+            PitchDetectionTests.tone(PitchDetectionTests.midiFrequency($0), sampleRate: sampleRate, count: total, weights: overtones, amplitude: 0.12, decay: 1.2)
+        }
+        let start = Int(0.6 * sampleRate)
+        let wrong = PitchDetectionTests.tone(PitchDetectionTests.midiFrequency(54), sampleRate: sampleRate, count: total - start,
+                                             weights: overtones, amplitude: 0.25, decay: 2)
+        var signal = (0..<total).map { index in chord.reduce(Float(0)) { $0 + $1[index] } }
+        for index in start..<total { signal[index] += wrong[index - start] }
+
+        let results = analyze(signal)
+        let secondStrike = try? XCTUnwrap(results.last { $0.isAttack }?.attackID)
+        let afterStrike = results.filter { $0.attackID == secondStrike && $0.chroma != nil && $0.framesSinceAttack <= MicAnalyzer.onsetChromaFrames }
+        XCTAssertFalse(afterStrike.isEmpty)
+        XCTAssertFalse(afterStrike.contains { ChromaAnalyzer.matches($0.chroma!, expected: [0, 4]) }, "ringing C-E must not count as the next chord")
+        XCTAssertTrue(afterStrike.contains { ($0.chroma![6]) >= 0.9 }, "the new F# should dominate the onset chroma")
+    }
+
     func testSuppressionIgnoresTheAppsOwnSound() {
         let analyzer = MicAnalyzer(sampleRate: sampleRate)
         analyzer.suppress(seconds: 2)

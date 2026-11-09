@@ -88,6 +88,29 @@ final class IndianPianoUITests: XCTestCase {
         picker.tap()
     }
 
+    func testBothHandsChordNeedsBothKeysAndShowsFingers() {
+        let app = launch(["-song", "twinkle", "-handMode", "both", "-notation", "carnatic", "-indianSystem", "carnatic",
+                          "-saPitchClass", "0", "-practiceMode", "wait", "-showFingers", "YES"])
+        let feedback = app.descendants(matching: .any).matching(identifier: "feedback").firstMatch
+        XCTAssertTrue(feedback.waitForExistence(timeout: 20))
+        // First step: C4 (RH finger 1) with C3 (LH finger 5), shown as Sa and mandra Sa.
+        waitFor(feedback, labelContaining: "finger 1")
+        waitFor(feedback, labelContaining: "finger 5")
+        waitFor(feedback, labelContaining: "Sa,")
+
+        key(app, 60).tap()
+        let stats = app.descendants(matching: .any).matching(identifier: "stats").firstMatch
+        waitFor(stats, labelContaining: "1 correct")
+        // Still waiting for the left hand.
+        waitFor(feedback, labelContaining: "Sa,")
+        key(app, 48).tap()
+        waitFor(stats, labelContaining: "2 correct")
+        // Next step is C4 alone (RH, finger 1); a wrong G4 shows the correction.
+        key(app, 67).tap()
+        waitFor(feedback, labelContaining: "Played")
+        waitFor(stats, labelContaining: "1 mistakes")
+    }
+
     func testHandModeSwitchShowsLeftHandNotes() {
         let app = launch(["-song", "twinkle", "-handMode", "right", "-notation", "western", "-practiceMode", "wait"])
         let feedback = app.descendants(matching: .any).matching(identifier: "feedback").firstMatch

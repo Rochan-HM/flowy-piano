@@ -28,6 +28,11 @@ final class ChromaAnalyzer {
     /// assigned to the pitch class of its interpolated frequency, so window leakage around low
     /// notes doesn't bleed into neighbouring semitones.
     func chroma(of samples: [Float]) -> [Float] {
+        chroma(fromSpectrum: spectrum(of: samples))
+    }
+
+    /// Hann-windowed FFT magnitudes (`size / 2` bins) of the most recent `size` samples.
+    func spectrum(of samples: [Float]) -> [Float] {
         var frame = [Float](repeating: 0, count: size)
         let take = min(samples.count, size)
         if take > 0 {
@@ -60,6 +65,14 @@ final class ChromaAnalyzer {
             }
         }
 
+        return magnitudes
+    }
+
+    /// Pitch-class profile of a magnitude spectrum: each peak goes to the pitch class of its
+    /// interpolated frequency, so window leakage doesn't bleed into neighbouring semitones.
+    func chroma(fromSpectrum magnitudes: [Float]) -> [Float] {
+        let half = size / 2
+        guard magnitudes.count == half else { return [Float](repeating: 0, count: 12) }
         var chroma = [Float](repeating: 0, count: 12)
         let floor = (magnitudes[lowestBin...highestBin].max() ?? 0) * 0.02
         let binWidth = sampleRate / Double(size)

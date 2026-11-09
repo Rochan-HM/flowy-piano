@@ -9,6 +9,9 @@ struct MicFrameResult: Sendable {
     /// Pitch-class profile; computed every other frame and on key strikes.
     var chroma: [Float]?
     var isAttack: Bool
+    /// Which key strike this frame belongs to (see `NoteOnsetTracker.attackCount`).
+    var attackID = 0
+    var framesSinceAttack = 0
 }
 
 /// The microphone analysis pipeline without any audio I/O: buffers incoming samples and, every
@@ -29,6 +32,10 @@ final class MicAnalyzer {
     private var pendingSinceLastHop = 0
     private var frameCounter = 0
     private var suppressedFrames = 0
+    private var previousSpectrum: [Float]?
+    private var attackBaseline: [Float]?
+    /// Frames after a strike (~0.3 s) during which chroma is computed from new energy only.
+    static let onsetChromaFrames = 13
 
     init(sampleRate: Double, frameSize: Int = 2048, hopSize: Int = 1024, chromaSize: Int = 8192, gateRMS: Float = 0.01) {
         self.sampleRate = sampleRate
@@ -49,6 +56,8 @@ final class MicAnalyzer {
     func reset() {
         history = []
         pendingSinceLastHop = 0
+        previousSpectrum = nil
+        attackBaseline = nil
         tracker.reset()
     }
 
@@ -75,7 +84,8 @@ final class MicAnalyzer {
         if suppressedFrames > 0 {
             suppressedFrames -= 1
             tracker.reset()
-            return MicFrameResult(rms: rms, estimate: nil, noteOnset: nil, chroma: nil, isAttack: false)
+            return MicFrameResult(rms: rms, estimate: nil, noteOnset: nil, chroma: nil, isAttack: false,
+                                  attackID: tracker.attackCount, framesSinceAttack: tracker.framesSinceAttack)
         }
 
         let estimate = rms >= gateRMS * 0.6 ? detector.detect(frame) : nil
@@ -83,9 +93,28 @@ final class MicAnalyzer {
         frameCounter += 1
 
         var chroma: [Float]?
-        if rms >= gateRMS, frameCounter % 2 == 0 || tracker.lastFrameWasAttack, end >= chromaSize / 2 {
-            chroma = chromaAnalyzer.chroma(of: Array(history[max(0, end - chromaSize)..<end]))
+        if tracker.lastFrameWasAttack {
+            attackBaseline = previousSpectrum ?? [Float](repeating: 0, count: chromaSize / 2)
         }
-        return MicFrameResult(rms: rms, estimate: estimate, noteOnset: onset, chroma: chroma, isAttack: tracker.lastFrameWasAttack)
+        if rms >= gateRMS * 0.3 {
+            let spectrum = chromaAnalyzer.spectrum(of: Array(history[max(0, end - chromaSize)..<end]))
+            if tracker.framesSinceAttack <= Self.onsetChromaFrames {
+                // Onset chroma: only energy that rose since just before the strike, so notes still
+                // ringing from the previous step can't make the new step look already played.
+                if tracker.framesSinceAttack > 0, let baseline = attackBaseline {
+                    let fresh = zip(spectrum, baseline).map { max(0, $0 - $1) }
+                    if fresh.reduce(0, +) >= 0.1 * spectrum.reduce(0, +) {
+                        chroma = chromaAnalyzer.chroma(fromSpectrum: fresh)
+                    }
+                }
+            } else if rms >= gateRMS, frameCounter % 2 == 0 {
+                chroma = chromaAnalyzer.chroma(fromSpectrum: spectrum)
+            }
+            previousSpectrum = spectrum
+        } else {
+            previousSpectrum = nil
+        }
+        return MicFrameResult(rms: rms, estimate: estimate, noteOnset: onset, chroma: chroma, isAttack: tracker.lastFrameWasAttack,
+                              attackID: tracker.attackCount, framesSinceAttack: tracker.framesSinceAttack)
     }
 }

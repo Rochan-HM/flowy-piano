@@ -119,6 +119,32 @@ final class LessonEngineTests: XCTestCase {
         XCTAssertTrue(engine.isFinished)
     }
 
+    func testWrongNoteDuringAChordNeedsChromaConfirmation() {
+        let engine = makeEngine(.both)
+        engine.handle(midi: 48, source: .touch)
+        engine.handle(midi: 60, source: .touch)
+        engine.handle(midi: 62, source: .touch)
+        XCTAssertEqual(engine.currentStep?.notes.map(\.midi), [43, 64, 67])
+
+        XCTAssertFalse(engine.isWrongCandidateInChord(55), "G is in the chord (another octave)")
+        XCTAssertFalse(engine.isWrongCandidateInChord(74), "D is the previous step still ringing")
+        XCTAssertTrue(engine.isWrongCandidateInChord(65))
+
+        var chord = [Float](repeating: 0.05, count: 12)
+        chord[7] = 1; chord[4] = 0.8
+        XCTAssertFalse(engine.chromaConfirmsWrong(65, chroma: chord))
+        var single = [Float](repeating: 0.05, count: 12)
+        single[5] = 1; single[0] = 0.25
+        XCTAssertTrue(engine.chromaConfirmsWrong(65, chroma: single))
+
+        engine.registerWrong(played: 65)
+        XCTAssertEqual(engine.wrongCount, 1)
+        guard case let .wrong(played, expected)? = engine.feedback else { return XCTFail("expected wrong-note feedback") }
+        XCTAssertEqual(played, 65)
+        XCTAssertEqual(expected.map(\.midi), [43, 64, 67])
+        XCTAssertEqual(engine.currentIndex, 2)
+    }
+
     func testTempoModeMarksMissedStepsAndScoresHits() {
         let engine = makeEngine(.right, practice: .tempo)
         engine.tempoScale = 1

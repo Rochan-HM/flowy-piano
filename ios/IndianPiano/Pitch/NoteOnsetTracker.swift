@@ -7,14 +7,14 @@ import Foundation
 /// piano note isn't counted twice while repeated notes still are.
 struct NoteOnsetTracker {
     var gateRMS: Float = 0.01
-    var attackRatio: Float = 1.8
+    var attackRatio: Float = 1.6
     var stableFrames = 2
     var minimumConfidence = 0.8
 
     private var candidate: Int?
     private var candidateCount = 0
     private var reported: Int?
-    private var previousRMS: Float = 0
+    private var recentRMS: [Float] = []
 
     init(gateRMS: Float = 0.01) {
         self.gateRMS = gateRMS
@@ -22,17 +22,30 @@ struct NoteOnsetTracker {
 
     /// Returns true when this frame looks like a new key strike.
     private(set) var lastFrameWasAttack = false
+    /// Increments on every key strike, so readings can be tied to the strike that caused them.
+    private(set) var attackCount = 0
+    private(set) var framesSinceAttack = 1_000
 
     mutating func process(_ estimate: PitchEstimate?, rms: Float) -> Int? {
-        defer { previousRMS = rms }
+        defer {
+            recentRMS.append(rms)
+            if recentRMS.count > 3 { recentRMS.removeFirst() }
+        }
         lastFrameWasAttack = false
+        framesSinceAttack += 1
 
         if rms < gateRMS * 0.6 {
             reset()
             return nil
         }
-        if rms > gateRMS && rms > previousRMS * attackRatio {
+        // Over notes that are still ringing, a strike's loudness rises across two or three frames,
+        // so compare with the quietest recent frame; the refractory period stops one strike counting twice.
+        let quietestRecent = recentRMS.min() ?? 0
+        let stillRising = rms > (recentRMS.last ?? 0) * 1.1
+        if rms > gateRMS && rms > quietestRecent * attackRatio && stillRising && framesSinceAttack >= 3 {
             lastFrameWasAttack = true
+            attackCount += 1
+            framesSinceAttack = 0
             reported = nil
             candidate = nil
             candidateCount = 0

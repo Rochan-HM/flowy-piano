@@ -128,6 +128,14 @@ final class AppModel {
     @ObservationIgnored private var started = false
     @ObservationIgnored private var stickyFlashes = false
     @ObservationIgnored private var recognitionTask: Task<Void, Never>?
+    /// Key strike that completed the last chord step via chroma.
+    @ObservationIgnored private var chordAttack: Int?
+    /// Latest key strike heard, and the strike that was latest when the current step began:
+    /// a step only accepts chords from strikes made after it became current.
+    @ObservationIgnored private var latestAttack = 0
+    @ObservationIgnored private var stepAttackFloor = 0
+    /// A pitch reading in a chord step that may be a wrong note, waiting for chroma to confirm it.
+    @ObservationIgnored private var pendingChordWrong: (midi: Int, attack: Int)?
     @ObservationIgnored private let log = Logger(subsystem: "com.rochan.indianpiano", category: "lesson")
 
     var naming: NoteNamingScheme { notation.makeScheme(saPitchClass: saPitchClass) }
@@ -180,14 +188,19 @@ final class AppModel {
         AudioSessionConfigurator.configure(recording: false)
         synth.start()
 
-        lesson.onStepChanged = { [weak self] in self?.revealExpectedKeys() }
+        lesson.onStepChanged = { [weak self] in
+            guard let self else { return }
+            self.stepAttackFloor = self.latestAttack
+            self.pendingChordWrong = nil
+            self.revealExpectedKeys()
+        }
         lesson.onAccompaniment = { [weak self] note, duration in
             guard let self, self.playOtherHand, self.soundEnabled else { return }
             self.synth.play(note.midi, duration: duration, velocity: 0.55)
             self.mic.suppress(for: min(duration, 1) + 0.3)
         }
-        mic.onNote = { [weak self] midi in self?.process(midi, source: .microphone) }
-        mic.onChroma = { [weak self] chroma in self?.handleMicChroma(chroma) }
+        mic.onNote = { [weak self] midi, attack in self?.handleMicNote(midi, attack: attack) }
+        mic.onChroma = { [weak self] chroma, attack, age in self?.handleMicChroma(chroma, attack: attack, framesSinceAttack: age) }
 
         Task {
             let initial = library.entry(id: defaults.string(forKey: Keys.song) ?? "") ?? SongLibrary.bundledSongs[0]
@@ -322,7 +335,32 @@ final class AppModel {
         mic.suppress(for: 1.2)
     }
 
-    private func process(_ midi: Int, source: LessonEngine.InputSource) {
+    /// Keeps strike bookkeeping consistent when a new listening session restarts the strike count.
+    private func noteAttack(_ attack: Int) {
+        if attack < latestAttack {
+            latestAttack = 0
+            stepAttackFloor = 0
+            chordAttack = nil
+        }
+        latestAttack = max(latestAttack, attack)
+    }
+
+    private func handleMicNote(_ midi: Int, attack: Int) {
+        noteAttack(attack)
+        // A strike that already completed a chord step can still produce a (often sub-octave)
+        // pitch reading a moment later; it belongs to that chord, not to the next step.
+        if attack == chordAttack {
+            logInput("mic", played: "\(midi)", result: .ignored, stepBefore: lesson.currentIndex, expected: lesson.remainingNotes)
+            return
+        }
+        let result = process(midi, source: .microphone)
+        if result == .ignored, lesson.isWrongCandidateInChord(midi) {
+            pendingChordWrong = (midi, attack)
+        }
+    }
+
+    @discardableResult
+    private func process(_ midi: Int, source: LessonEngine.InputSource) -> LessonEngine.InputResult {
         let completedBefore = lesson.currentStep?.notes ?? []
         let stepBefore = lesson.currentIndex
         let remainingBefore = lesson.remainingNotes
@@ -337,15 +375,32 @@ final class AppModel {
             break
         }
         logInput(source == .touch ? "touch" : "mic", played: "\(midi)", result: result, stepBefore: stepBefore, expected: remainingBefore)
+        return result
     }
 
-    private func handleMicChroma(_ chroma: [Float]) {
+    private func handleMicChroma(_ chroma: [Float], attack: Int, framesSinceAttack: Int) {
+        noteAttack(attack)
         let notes = lesson.currentStep?.notes ?? []
         let stepBefore = lesson.currentIndex
+        guard attack > stepAttackFloor else { return }
         if lesson.handleChroma(chroma) {
+            chordAttack = attack
+            pendingChordWrong = nil
             for note in notes { flash(note.midi, .correct) }
             let heard = ChromaAnalyzer.activePitchClasses(chroma, level: 0.3).map(String.init).joined(separator: "+")
             logInput("mic-chord", played: "pc\(heard)", result: .correct(completedStep: true), stepBefore: stepBefore, expected: notes)
+            return
+        }
+        guard let pending = pendingChordWrong else { return }
+        if pending.attack != attack || framesSinceAttack > MicController.chromaWindowFrames {
+            pendingChordWrong = nil
+        } else if framesSinceAttack >= 4, lesson.chromaConfirmsWrong(pending.midi, chroma: chroma) {
+            // ~90 ms after the strike the new sound dominates the chroma window.
+            pendingChordWrong = nil
+            let remaining = lesson.remainingNotes
+            lesson.registerWrong(played: pending.midi)
+            flash(pending.midi, .wrong)
+            logInput("mic-chord", played: "\(pending.midi)", result: .wrong, stepBefore: stepBefore, expected: remaining)
         }
     }
 

@@ -20,11 +20,13 @@ final class MicController {
     private(set) var heardNote: Int?
     private(set) var heardPitchClasses: [Int] = []
 
-    @ObservationIgnored var onNote: ((Int) -> Void)?
-    @ObservationIgnored var onChroma: (([Float]) -> Void)?
+    /// (MIDI note, ID of the key strike it came from).
+    @ObservationIgnored var onNote: ((Int, Int) -> Void)?
+    /// (chroma, key-strike ID, analysis frames since that strike).
+    @ObservationIgnored var onChroma: (([Float], Int, Int) -> Void)?
+    static let chromaWindowFrames = 13
     @ObservationIgnored private let listener = MicListener()
     @ObservationIgnored private let fileFeeder = MicFileFeeder()
-    @ObservationIgnored private var lastAttack: TimeInterval = 0
     @ObservationIgnored private var lastNoteTime: TimeInterval = 0
 
     var isListening: Bool { status == .listening }
@@ -135,18 +137,17 @@ final class MicController {
         let normalized = max(0, min(1, (decibels + 60) / 60))
         level = max(normalized, level * 0.85)
 
-        if result.isAttack { lastAttack = now }
         if let note = result.noteOnset {
             heardNote = note
             lastNoteTime = now
-            onNote?(note)
+            onNote?(note, result.attackID)
         } else if now - lastNoteTime > 1.5 {
             heardNote = nil
         }
         if let chroma = result.chroma {
             heardPitchClasses = Array(ChromaAnalyzer.activePitchClasses(chroma, level: 0.6).prefix(4))
-            // Only trust chords shortly after a key strike, so a ringing chord doesn't match the next step.
-            if now - lastAttack < 0.3 { onChroma?(chroma) }
+            // Only trust chords shortly after a key strike (~0.3 s), so a ringing chord doesn't match the next step.
+            if result.framesSinceAttack <= Self.chromaWindowFrames { onChroma?(chroma, result.attackID, result.framesSinceAttack) }
         }
     }
 }

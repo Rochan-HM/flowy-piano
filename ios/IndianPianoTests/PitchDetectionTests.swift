@@ -114,6 +114,7 @@ final class PitchDetectionTests: XCTestCase {
         for rms in [0.2, 0.19] { feed(62, Float(rms)) }
 
         XCTAssertEqual(onsets, [60, 60, 62, 62])
+        XCTAssertEqual(tracker.attackCount, 3, "first strike, re-strike, strike after silence")
     }
 
     func testOnsetTrackerIgnoresQuietAndUnsureFrames() {

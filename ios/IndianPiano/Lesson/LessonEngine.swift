@@ -252,6 +252,33 @@ final class LessonEngine {
         return true
     }
 
+    /// Whether a single-pitch microphone reading during a chord step may be a wrong note, rather than
+    /// a chord member heard at another octave or the previous step still ringing. Confirm it with
+    /// `chromaConfirmsWrong` before calling `registerWrong`.
+    func isWrongCandidateInChord(_ midi: Int) -> Bool {
+        guard let step = currentStep, step.notes.count > 1 else { return false }
+        let pitchClass = MIDINote.pitchClass(midi)
+        if step.notes.contains(where: { MIDINote.pitchClass($0.midi) == pitchClass }) { return false }
+        if currentIndex > 0, steps[currentIndex - 1].notes.contains(where: { MIDINote.pitchClass($0.midi) == pitchClass }) {
+            return false
+        }
+        return true
+    }
+
+    /// The chroma of a key strike is dominated by `midi`'s pitch class and doesn't contain the chord.
+    func chromaConfirmsWrong(_ midi: Int, chroma: [Float]) -> Bool {
+        guard let step = currentStep, chroma.count == 12 else { return false }
+        let expected = Set(step.notes.map { MIDINote.pitchClass($0.midi) })
+        return chroma[MIDINote.pitchClass(midi)] >= 0.6 && !ChromaAnalyzer.matches(chroma, expected: expected)
+    }
+
+    func registerWrong(played midi: Int) {
+        guard currentStep != nil, !(practiceMode == .tempo && !isPlaying) else { return }
+        wrongCount += 1
+        stepHadMistake = true
+        setFeedback(.wrong(played: midi, expected: remainingNotes))
+    }
+
     static func matches(_ played: Int, _ expected: Int, octaveTolerant: Bool) -> Bool {
         played == expected || (octaveTolerant && MIDINote.pitchClass(played) == MIDINote.pitchClass(expected))
     }
