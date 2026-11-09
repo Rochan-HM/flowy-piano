@@ -212,6 +212,14 @@ def play_blackhole(wav):
     sh("sox", wav, "-t", "coreaudio", "BlackHole 2ch")
 
 
+def audio_device(kind):
+    return sh("SwitchAudioSource", "-c", "-t", kind).stdout.strip()
+
+
+def set_audio_device(kind, name):
+    sh("SwitchAudioSource", "-t", kind, "-s", name)
+
+
 def run_case(case, args, recognition):
     folder = os.path.join(WORK, case["name"])
     os.makedirs(folder, exist_ok=True)
@@ -271,6 +279,13 @@ def main():
     time.sleep(1.5)
     recognition = dict(url=args.omr_url, token=args.omr_token)
     results = []
+    original_devices = None
+    if args.input == "blackhole":
+        # Only the default input changes (the Simulator listens on it); playback goes straight to
+        # BlackHole, so the user's output device and volume are never touched.
+        original_devices = dict(input=audio_device("input"), output=audio_device("output"))
+        print(f"audio devices before the run: {original_devices}", flush=True)
+        set_audio_device("input", "BlackHole 2ch")
     try:
         for case in CASES:
             if args.case and case["name"] not in args.case:
@@ -286,6 +301,11 @@ def main():
     finally:
         logger.terminate()
         simctl("terminate", "booted", BUNDLE, check=False)
+        if original_devices:
+            set_audio_device("input", original_devices["input"])
+            if audio_device("output") != original_devices["output"]:
+                set_audio_device("output", original_devices["output"])
+            print(f"audio devices restored: input={audio_device('input')}, output={audio_device('output')}", flush=True)
     with open(os.path.join(WORK, f"results-{args.input}.json"), "w") as handle:
         json.dump(results, handle, indent=1)
 
