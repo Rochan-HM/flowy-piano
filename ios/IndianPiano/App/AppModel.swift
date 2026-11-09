@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 import SwiftUI
 
 enum KeyLabelMode: String, CaseIterable, Identifiable {
@@ -49,6 +50,14 @@ final class AppModel {
         static let handMode = "handMode"
         static let practiceMode = "practiceMode"
         static let tempoScale = "tempoScale"
+        static let recognitionEnabled = "recognitionEnabled"
+        static let recognitionURL = "recognitionURL"
+        static let recognitionToken = "recognitionToken"
+    }
+
+    enum RecognitionStatus: Equatable {
+        case idle
+        case working(RecognitionProgress, name: String)
     }
 
     // MARK: Settings
@@ -73,6 +82,15 @@ final class AppModel {
             lowestWhiteKey = clampedLowestWhite(lowestWhiteKey)
         }
     }
+    /// Photo/PDF import through the recognition server (off until a server is set up).
+    var recognitionEnabled: Bool { didSet { defaults.set(recognitionEnabled, forKey: Keys.recognitionEnabled) } }
+    var recognitionServerURL: String { didSet { defaults.set(recognitionServerURL, forKey: Keys.recognitionURL) } }
+    /// Kept in the Keychain, not UserDefaults.
+    var recognitionToken: String { didSet { Keychain.write(recognitionToken, account: Keys.recognitionToken) } }
+
+    var isRecognitionReady: Bool {
+        recognitionEnabled && !recognitionServerURL.trimmingCharacters(in: .whitespaces).isEmpty && !recognitionToken.isEmpty
+    }
 
     // MARK: Runtime state
 
@@ -89,11 +107,16 @@ final class AppModel {
     var lowestWhiteKey: Int
     var isLibraryPresented = false
     var isSettingsPresented = false
+    private(set) var recognitionStatus: RecognitionStatus = .idle
+    /// Shown once after an import that came with warnings (e.g. no finger numbers from scans).
+    var importNotes: [String] = []
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var flashToken = 0
     @ObservationIgnored private var started = false
     @ObservationIgnored private var stickyFlashes = false
+    @ObservationIgnored private var recognitionTask: Task<Void, Never>?
+    @ObservationIgnored private let log = Logger(subsystem: "com.rochan.indianpiano", category: "lesson")
 
     var naming: NoteNamingScheme { notation.makeScheme(saPitchClass: saPitchClass) }
 
@@ -116,6 +139,10 @@ final class AppModel {
         let storedVisible = defaults.integer(forKey: Keys.visibleWhiteKeys)
         visibleWhiteKeys = storedVisible >= 7 ? min(storedVisible, 36) : 15
         lowestWhiteKey = KeyboardLayout.whiteIndex(of: 53)
+        recognitionEnabled = defaults.bool(forKey: Keys.recognitionEnabled)
+        recognitionServerURL = defaults.string(forKey: Keys.recognitionURL) ?? ""
+        // A launch argument can supply the token for automated runs; it isn't persisted.
+        recognitionToken = defaults.string(forKey: Keys.recognitionToken) ?? Keychain.read(Keys.recognitionToken) ?? ""
 
         lesson.handMode = LessonEngine.HandMode(rawValue: defaults.string(forKey: Keys.handMode) ?? "") ?? .right
         lesson.practiceMode = LessonEngine.PracticeMode(rawValue: defaults.string(forKey: Keys.practiceMode) ?? "") ?? .wait
@@ -180,6 +207,63 @@ final class AppModel {
         }
     }
 
+    // MARK: Sheet music recognition
+
+    /// Uploads photos or a PDF to the recognition server and opens the returned score.
+    func recognize(_ uploads: [RecognitionUpload], name: String) {
+        recognitionTask?.cancel()
+        recognitionTask = Task { [weak self] in await self?.runRecognition(uploads, name: name) }
+    }
+
+    func cancelRecognition() {
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionStatus = .idle
+    }
+
+    func checkRecognitionServer() async -> String {
+        do {
+            let client = try RecognitionClient(serverURL: recognitionServerURL, token: recognitionToken)
+            let health = try await client.health()
+            return "Connected: \(health.engine.name) \(health.engine.version) (\(health.status))"
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private func runRecognition(_ uploads: [RecognitionUpload], name: String) async {
+        guard isRecognitionReady else {
+            errorMessage = RecognitionError.notConfigured.errorDescription
+            return
+        }
+        recognitionStatus = .working(RecognitionProgress(phase: .uploading), name: name)
+        let started = Date()
+        do {
+            let client = try RecognitionClient(serverURL: recognitionServerURL, token: recognitionToken)
+            let result = try await client.recognize(uploads) { progress in
+                Task { @MainActor [weak self] in
+                    guard let self, case .working = self.recognitionStatus else { return }
+                    self.recognitionStatus = .working(progress, name: name)
+                }
+            }
+            let safeName = name.components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>")).joined(separator: "-")
+            let file = FileManager.default.temporaryDirectory.appendingPathComponent("\(safeName).musicxml")
+            try result.musicXML.write(to: file, options: .atomic)
+            var seen = Set<String>()
+            let notes = result.warnings.map(\.userMessage).filter { seen.insert($0).inserted }
+            let entry = try await library.importFile(at: file, sourceLabel: "Scanned", notes: notes)
+            recognitionStatus = .idle
+            await select(entry)
+            importNotes = notes
+            log.info("Recognized \(name, privacy: .public) in \(Int(Date().timeIntervalSince(started)), privacy: .public) s: \(self.lesson.score?.notes.count ?? 0, privacy: .public) notes, warnings=\(result.warnings.map(\.code).joined(separator: ","), privacy: .public)")
+        } catch {
+            recognitionStatus = .idle
+            if Task.isCancelled || (error as? RecognitionError) == .canceled { return }
+            log.error("Recognition failed: \(error.localizedDescription, privacy: .public)")
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func setHandMode(_ mode: LessonEngine.HandMode) {
         lesson.handMode = mode
         defaults.set(mode.rawValue, forKey: Keys.handMode)
@@ -223,6 +307,8 @@ final class AppModel {
 
     private func process(_ midi: Int, source: LessonEngine.InputSource) {
         let completedBefore = lesson.currentStep?.notes ?? []
+        let stepBefore = lesson.currentIndex
+        let remainingBefore = lesson.remainingNotes
         let result = lesson.handle(midi: midi, source: source, octaveTolerant: source == .microphone && micOctaveTolerant)
         switch result {
         case .correct:
@@ -233,13 +319,30 @@ final class AppModel {
         case .ignored:
             break
         }
+        logInput(source == .touch ? "touch" : "mic", played: "\(midi)", result: result, stepBefore: stepBefore, expected: remainingBefore)
     }
 
     private func handleMicChroma(_ chroma: [Float]) {
         let notes = lesson.currentStep?.notes ?? []
+        let stepBefore = lesson.currentIndex
         if lesson.handleChroma(chroma) {
             for note in notes { flash(note.midi, .correct) }
+            let heard = ChromaAnalyzer.activePitchClasses(chroma, level: 0.3).map(String.init).joined(separator: "+")
+            logInput("mic-chord", played: "pc\(heard)", result: .correct(completedStep: true), stepBefore: stepBefore, expected: notes)
         }
+    }
+
+    /// One parseable line per input, used by the end-to-end test harness (`tools/e2e`).
+    private func logInput(_ source: String, played: String, result: LessonEngine.InputResult, stepBefore: Int, expected: [ScoreNote]) {
+        let outcome: String
+        switch result {
+        case .correct(let completed): outcome = completed ? "advance" : "partial"
+        case .wrong: outcome = "wrong"
+        case .ignored: outcome = "ignored"
+        }
+        let expectedText = expected.map { "\($0.midi)\($0.hand == .right ? "R" : "L")\($0.finger.map { "f\($0)" } ?? "")" }.joined(separator: ",")
+        let label = expected.map { naming.label(forMIDI: $0.midi, spelling: $0.spelling).fullText }.joined(separator: "+")
+        log.info("LESSON source=\(source, privacy: .public) played=\(played, privacy: .public) result=\(outcome, privacy: .public) step=\(stepBefore, privacy: .public)->\(self.lesson.currentIndex, privacy: .public)/\(self.lesson.steps.count, privacy: .public) expected=\(expectedText, privacy: .public) labels=\(label, privacy: .public)")
     }
 
     private func flash(_ midi: Int, _ kind: KeyFlash.Kind) {
@@ -335,11 +438,25 @@ final class AppModel {
     // MARK: Launch options (used for screenshots and automated checks)
 
     /// Supported launch arguments, besides any settings key (e.g. `-notation carnatic -saPitchClass D`):
-    /// `-importPath <file>`, `-demoSteps <n>`, `-demoWrongNote <midi>`, `-demoPressNote <midi>`,
-    /// `-autoPlay YES` (tempo mode), `-openLibrary YES`, `-openSettings YES`, `-startMic YES`.
+    /// `-importPath <file>`, `-recognizeFile <pdf or image>`, `-exportLessonSteps <json path>`,
+    /// `-micFile <audio file>` (feeds the file through the microphone pipeline in real time),
+    /// `-demoSteps <n>`, `-demoWrongNote <midi>`, `-demoPressNote <midi>`, `-autoPlay YES` (tempo mode),
+    /// `-openLibrary YES`, `-openSettings YES`, `-startMic YES`.
     private func applyLaunchOptions() async {
         if let path = defaults.string(forKey: "importPath") {
             await importFile(URL(fileURLWithPath: path))
+        }
+        if let path = defaults.string(forKey: "recognizeFile") {
+            do {
+                let url = URL(fileURLWithPath: path)
+                recognize(try RecognitionPages.uploads(fromFile: url), name: url.deletingPathExtension().lastPathComponent)
+                await recognitionTask?.value
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+        if let path = defaults.string(forKey: "exportLessonSteps") {
+            exportLessonSteps(to: URL(fileURLWithPath: path))
         }
         let steps = defaults.integer(forKey: "demoSteps")
         if steps > 0 {
@@ -364,5 +481,36 @@ final class AppModel {
         if defaults.bool(forKey: "openLibrary") { isLibraryPresented = true }
         if defaults.bool(forKey: "openSettings") { isSettingsPresented = true }
         if defaults.bool(forKey: "startMic") { await mic.start() }
+        if let path = defaults.string(forKey: "micFile") {
+            try? await Task.sleep(for: .milliseconds(defaults.integer(forKey: "micFileDelayMs")))
+            await mic.startFile(URL(fileURLWithPath: path))
+        }
+    }
+
+    /// Writes the current lesson's steps as JSON so test tools can build a matching performance.
+    private func exportLessonSteps(to url: URL) {
+        struct ExportedNote: Encodable { var midi: Int; var hand: String; var finger: Int?; var label: String }
+        struct ExportedStep: Encodable { var index: Int; var time: Double; var measure: Int; var notes: [ExportedNote] }
+        struct Export: Encodable { var title: String; var handMode: String; var notation: String; var sa: Int; var steps: [ExportedStep] }
+        let export = Export(
+            title: lesson.score?.title ?? "",
+            handMode: lesson.handMode.rawValue,
+            notation: notation.rawValue,
+            sa: saPitchClass,
+            steps: lesson.steps.map { step in
+                ExportedStep(index: step.id, time: step.time, measure: step.measure, notes: step.notes.map {
+                    ExportedNote(midi: $0.midi, hand: $0.hand.rawValue, finger: $0.finger,
+                                 label: naming.label(forMIDI: $0.midi, spelling: $0.spelling).fullText)
+                })
+            }
+        )
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(export).write(to: url, options: .atomic)
+            log.info("Exported \(self.lesson.steps.count, privacy: .public) lesson steps to \(url.path, privacy: .public)")
+        } catch {
+            log.error("Couldn't export lesson steps: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }

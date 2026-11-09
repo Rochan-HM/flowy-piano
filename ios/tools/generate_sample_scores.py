@@ -277,6 +277,10 @@ def main():
     write(os.path.join(SONGS, "minuet-in-g.musicxml"), minuet)
     os.makedirs(FIXTURES, exist_ok=True)
     write_mxl(os.path.join(FIXTURES, "minuet-in-g.mxl"), "score.musicxml", minuet)
+    no_container = os.path.join(FIXTURES, "ode-no-container.mxl")
+    with zipfile.ZipFile(no_container, "w") as archive:
+        archive.writestr("ode-to-joy.xml", ode, compress_type=zipfile.ZIP_DEFLATED)
+    print("wrote", os.path.relpath(no_container, ROOT))
     write_midi(os.path.join(FIXTURES, "two-hands.mid"))
 
 

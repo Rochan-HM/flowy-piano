@@ -1,5 +1,6 @@
 import Foundation
 import UniformTypeIdentifiers
+import ZIPFoundation
 
 struct MusicXMLImporter: ScoreImporter {
     var name: String { "MusicXML" }
@@ -15,24 +16,39 @@ struct MusicXMLImporter: ScoreImporter {
     static func isZip(_ data: Data) -> Bool { data.starts(with: [0x50, 0x4B, 0x03, 0x04]) }
 }
 
-/// Reads `.mxl` (zipped MusicXML) containers.
+/// Reads `.mxl` (zipped MusicXML) containers with ZIPFoundation.
 enum MXLContainer {
     static func scoreData(fromArchive data: Data) throws -> Data {
-        let archive = try ZipArchive(data: data)
-        if let container = archive.entry(named: "META-INF/container.xml"),
-           let xml = try? XMLTreeElement.parse(archive.contents(of: container)) {
+        let archive: Archive
+        do {
+            archive = try Archive(data: data, accessMode: .read)
+        } catch {
+            throw ScoreImportError.invalidFormat("the .mxl archive can't be opened")
+        }
+        if let container = archive["META-INF/container.xml"],
+           let xml = try? XMLTreeElement.parse(contents(of: container, in: archive)) {
             let rootfiles = xml.descendants("rootfile")
             let scoreFile = rootfiles.first { ($0.attributes["media-type"] ?? "application/vnd.recordare.musicxml+xml").contains("musicxml") }
-            if let path = scoreFile?.attributes["full-path"], let entry = archive.entry(named: path) {
-                return try archive.contents(of: entry)
+            if let path = scoreFile?.attributes["full-path"], let entry = archive[path] {
+                return try contents(of: entry, in: archive)
             }
         }
-        let fallback = archive.entries.first { entry in
+        let fallback = archive.first { entry in
             let ext = (entry.path as NSString).pathExtension.lowercased()
-            return !entry.path.hasPrefix("META-INF/") && (ext == "xml" || ext == "musicxml")
+            return entry.type == .file && !entry.path.hasPrefix("META-INF/") && (ext == "xml" || ext == "musicxml")
         }
         guard let fallback else { throw ScoreImportError.invalidFormat("no MusicXML score inside the .mxl archive") }
-        return try archive.contents(of: fallback)
+        return try contents(of: fallback, in: archive)
+    }
+
+    private static func contents(of entry: Entry, in archive: Archive) throws -> Data {
+        var data = Data()
+        do {
+            _ = try archive.extract(entry) { data.append($0) }
+        } catch {
+            throw ScoreImportError.invalidFormat("couldn't decompress \(entry.path) from the .mxl archive")
+        }
+        return data
     }
 }
 
@@ -170,11 +186,14 @@ enum MusicXMLParser {
         }
 
         assignHands(&infos)
+        // In a song (voice + piano) only the two-staff piano part is practised.
+        let pianoParts = infos.filter { $0.staves >= 2 && !$0.notes.isEmpty }
+        let practiced = pianoParts.isEmpty ? infos : pianoParts
 
         var score = Score(
             title: title(of: root) ?? fallbackTitle,
             composer: composer(of: root),
-            notes: infos.flatMap(\.notes),
+            notes: practiced.flatMap(\.notes),
             tempoMap: TempoMap(tempos),
             timeSignature: timeSignature ?? TimeSignature(beats: 4, beatType: 4),
             keyFifths: keyFifths,

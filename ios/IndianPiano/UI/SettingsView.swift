@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @State private var connectionStatus: String?
 
     var body: some View {
         @Bindable var model = model
@@ -52,6 +53,36 @@ struct SettingsView: View {
                     Stepper(value: $model.visibleWhiteKeys, in: 8...36) {
                         LabeledContent("Visible white keys", value: "\(model.visibleWhiteKeys)")
                     }
+                }
+
+                Section {
+                    Toggle("Import photos and PDFs", isOn: $model.recognitionEnabled)
+                        .accessibilityIdentifier("recognitionToggle")
+                    if model.recognitionEnabled {
+                        TextField("Server URL, e.g. https://omr.example.com", text: $model.recognitionServerURL)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("recognitionURL")
+                        SecureField("Access token", text: $model.recognitionToken)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("recognitionToken")
+                        Button {
+                            connectionStatus = "Checking…"
+                            Task { connectionStatus = await model.checkRecognitionServer() }
+                        } label: {
+                            Label("Test connection", systemImage: "antenna.radiowaves.left.and.right")
+                        }
+                        .disabled(model.recognitionServerURL.isEmpty)
+                        if let connectionStatus {
+                            Text(connectionStatus).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Sheet music recognition")
+                } footer: {
+                    Text("Photos and PDFs of printed piano music are uploaded to your recognition server (the rochan-piano OMR server), which returns MusicXML. The token is stored in the Keychain.")
                 }
             }
             .navigationTitle("Settings")

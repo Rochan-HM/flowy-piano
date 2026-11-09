@@ -23,6 +23,7 @@ final class MicController {
     @ObservationIgnored var onNote: ((Int) -> Void)?
     @ObservationIgnored var onChroma: (([Float]) -> Void)?
     @ObservationIgnored private let listener = MicListener()
+    @ObservationIgnored private let fileFeeder = MicFileFeeder()
     @ObservationIgnored private var lastAttack: TimeInterval = 0
     @ObservationIgnored private var lastNoteTime: TimeInterval = 0
 
@@ -34,6 +35,17 @@ final class MicController {
         case .denied: return "Denied — enable it in Settings › Privacy › Microphone"
         case .undetermined: return "Not asked yet"
         @unknown default: return "Unknown"
+        }
+    }
+
+    /// Feeds a recording through the same analysis as the live microphone (for automated tests).
+    func startFile(_ url: URL) async {
+        do {
+            try fileFeeder.start(url: url, onFrame: { [weak self] result in self?.handle(result) },
+                                 onFinish: { [weak self] in self?.status = .off })
+            status = .listening
+        } catch {
+            status = .failed(error.localizedDescription)
         }
     }
 
@@ -100,6 +112,7 @@ final class MicController {
         """
 
     func stop() {
+        fileFeeder.stop()
         let listener = self.listener
         Task.detached(priority: .userInitiated) {
             listener.stop()

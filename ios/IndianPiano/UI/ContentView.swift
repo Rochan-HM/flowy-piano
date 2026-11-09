@@ -40,6 +40,14 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+        .alert("Imported from your scan", isPresented: Binding(
+            get: { model.errorMessage == nil && !model.importNotes.isEmpty },
+            set: { if !$0 { model.importNotes = [] } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.importNotes.joined(separator: "\n\n"))
+        }
         .alert("Microphone unavailable", isPresented: Binding(
             get: { model.errorMessage == nil && model.mic.failureMessage != nil },
             set: { if !$0 { model.mic.dismissFailure() } }

@@ -3,8 +3,9 @@ import UniformTypeIdentifiers
 
 /// What the user handed us to turn into a score.
 ///
-/// Only files are supported today. Sheet-music recognition (photos / PDFs) and audio
-/// transcription plug in later as new cases here plus a `ScoreImporter` that accepts them.
+/// Score files are parsed on the device. Photos and PDFs of printed music go through the
+/// recognition server first (`RecognitionClient`), which returns MusicXML that is imported here
+/// as a file. Other sources (e.g. audio transcription) plug in the same way.
 enum ScoreImportInput: Sendable {
     case file(URL)
 }

@@ -186,16 +186,42 @@ final class MusicXMLParserTests: XCTestCase {
         XCTAssertEqual(compressed.notes.map(\.finger), plain.notes.map(\.finger))
     }
 
-    func testZipArchiveReadsStoredAndDeflatedEntries() throws {
+    func testMXLContainerFollowsRootfileAndInflates() throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "minuet-in-g", withExtension: "mxl"))
-        let archive = try ZipArchive(data: Data(contentsOf: url))
-        XCTAssertEqual(archive.entries.map(\.path), ["mimetype", "META-INF/container.xml", "score.musicxml"])
-        let mimetype = try XCTUnwrap(archive.entry(named: "mimetype"))
-        XCTAssertEqual(mimetype.method, 0)
-        XCTAssertEqual(String(decoding: try archive.contents(of: mimetype), as: UTF8.self), "application/vnd.recordare.musicxml")
-        let score = try XCTUnwrap(archive.entry(named: "score.musicxml"))
-        XCTAssertEqual(score.method, 8)
-        XCTAssertEqual(try archive.contents(of: score).count, score.uncompressedSize)
+        let xml = try MXLContainer.scoreData(fromArchive: Data(contentsOf: url))
+        let plain = try Data(contentsOf: try XCTUnwrap(Bundle.main.url(forResource: "minuet-in-g", withExtension: "musicxml")))
+        XCTAssertEqual(xml, plain)
+    }
+
+    func testMXLWithoutContainerFallsBackToTheFirstScore() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ode-no-container", withExtension: "mxl"))
+        let score = try MusicXMLParser.parse(try MXLContainer.scoreData(fromArchive: Data(contentsOf: url)))
+        XCTAssertEqual(score.title, "Ode to Joy")
+        XCTAssertEqual(score.notes.count, 30)
+    }
+
+    func testCorruptArchiveIsRejected() {
+        var bytes = Data([0x50, 0x4B, 0x03, 0x04])
+        bytes.append(Data(repeating: 0x41, count: 64))
+        XCTAssertThrowsError(try MXLContainer.scoreData(fromArchive: bytes))
+    }
+
+    func testSongWithVoiceKeepsOnlyThePianoPart() throws {
+        let xml = """
+        <score-partwise version="4.0"><part-list>
+          <score-part id="P1"><part-name>Voice</part-name></score-part><score-part id="P2"><part-name>Piano</part-name></score-part>
+        </part-list>
+        <part id="P1"><measure number="1"><attributes><divisions>1</divisions><clef><sign>G</sign><line>2</line></clef></attributes>
+          <note><pitch><step>A</step><octave>4</octave></pitch><duration>1</duration></note></measure></part>
+        <part id="P2"><measure number="1"><attributes><divisions>1</divisions><staves>2</staves></attributes>
+          <note><pitch><step>E</step><octave>5</octave></pitch><duration>1</duration><staff>1</staff></note>
+          <backup><duration>1</duration></backup>
+          <note><pitch><step>C</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note></measure></part>
+        </score-partwise>
+        """
+        let notes = try parse(xml).notes
+        XCTAssertEqual(notes.map(\.midi), [48, 76])
+        XCTAssertEqual(notes.map(\.hand), [.left, .right])
     }
 
     func testImportServiceRoutesByExtension() {

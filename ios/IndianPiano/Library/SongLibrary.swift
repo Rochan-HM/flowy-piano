@@ -11,6 +11,8 @@ struct SongEntry: Identifiable, Hashable, Codable {
     var title: String
     var subtitle: String
     var origin: Origin
+    /// Things the learner should know about this score, e.g. recognition warnings.
+    var notes: [String]?
 
     var isBundled: Bool {
         if case .bundled = origin { return true }
@@ -66,7 +68,7 @@ final class SongLibrary {
     }
 
     /// Copies a user-picked file into the app, validates it by parsing, and adds it to the library.
-    func importFile(at source: URL) async throws -> SongEntry {
+    func importFile(at source: URL, sourceLabel: String? = nil, notes: [String] = []) async throws -> SongEntry {
         guard importService.importer(for: .file(source)) != nil else {
             throw ScoreImportError.unsupportedFile(source.pathExtension)
         }
@@ -80,7 +82,8 @@ final class SongLibrary {
         do {
             let score = try await importService.importScore(at: destination)
             let entry = SongEntry(id: "imported-\(fileName)", title: score.title,
-                                  subtitle: Self.describe(score), origin: .imported(fileName: fileName))
+                                  subtitle: Self.describe(score, sourceLabel: sourceLabel), origin: .imported(fileName: fileName),
+                                  notes: notes.isEmpty ? nil : notes)
             imported.insert(entry, at: 0)
             saveIndex()
             return entry
@@ -111,14 +114,14 @@ final class SongLibrary {
         }
     }
 
-    static func describe(_ score: Score) -> String {
+    static func describe(_ score: Score, sourceLabel: String? = nil) -> String {
         let hands: String
         switch (score.hands.contains(.right), score.hands.contains(.left)) {
         case (true, true): hands = "both hands"
         case (false, true): hands = "left hand"
         default: hands = "right hand"
         }
-        var parts = [score.sourceFormat, hands]
+        var parts = [sourceLabel ?? score.sourceFormat, hands]
         if score.hasFingerings { parts.append("fingering") }
         return parts.joined(separator: " · ")
     }
