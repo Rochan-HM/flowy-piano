@@ -135,7 +135,7 @@ struct KeyboardNavigator: View {
 
     var body: some View {
         let window = model.lowestWhiteKey
-        let visible = model.visibleWhiteKeys
+        let visible = model.shownWhiteKeys
         let expected = model.lesson.remainingNotes
         HStack(spacing: 8) {
             IconButton(systemName: "chevron.left.2", label: "Octave down") { model.shiftKeyboard(by: -7) }

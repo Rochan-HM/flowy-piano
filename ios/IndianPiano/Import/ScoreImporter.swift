@@ -87,9 +87,16 @@ extension ScoreImportInput {
         }
     }
 
+    /// Title to use when the score has none, e.g. "la-candeur.pdf" → "La candeur".
     var displayName: String {
         switch self {
-        case .file(let url): return url.deletingPathExtension().lastPathComponent
+        case .file(let url):
+            let words = url.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "_", with: " ")
+                .replacingOccurrences(of: "-", with: " ")
+                .split(separator: " ")
+                .joined(separator: " ")
+            return words.prefix(1).uppercased() + words.dropFirst()
         }
     }
 }

@@ -50,6 +50,7 @@ final class AppModel {
         static let handMode = "handMode"
         static let practiceMode = "practiceMode"
         static let tempoScale = "tempoScale"
+        static let autoZoom = "autoZoom"
         static let recognitionEnabled = "recognitionEnabled"
         static let recognitionURL = "recognitionURL"
         static let recognitionToken = "recognitionToken"
@@ -79,9 +80,20 @@ final class AppModel {
     var visibleWhiteKeys: Int {
         didSet {
             defaults.set(visibleWhiteKeys, forKey: Keys.visibleWhiteKeys)
-            lowestWhiteKey = clampedLowestWhite(lowestWhiteKey)
+            fitKeyboardToSong()
         }
     }
+    /// Zoom the keyboard out so the whole song fits, instead of scrolling between hands.
+    var autoZoom: Bool {
+        didSet {
+            defaults.set(autoZoom, forKey: Keys.autoZoom)
+            fitKeyboardToSong()
+        }
+    }
+    static let maxAutoZoomKeys = 26
+    /// Key count chosen for the current song by auto-zoom, if it needed more than `visibleWhiteKeys`.
+    private(set) var songWhiteKeys: Int?
+    var shownWhiteKeys: Int { songWhiteKeys ?? visibleWhiteKeys }
     /// Photo/PDF import through the recognition server (off until a server is set up).
     var recognitionEnabled: Bool { didSet { defaults.set(recognitionEnabled, forKey: Keys.recognitionEnabled) } }
     var recognitionServerURL: String { didSet { defaults.set(recognitionServerURL, forKey: Keys.recognitionURL) } }
@@ -139,6 +151,7 @@ final class AppModel {
         let storedVisible = defaults.integer(forKey: Keys.visibleWhiteKeys)
         visibleWhiteKeys = storedVisible >= 7 ? min(storedVisible, 36) : 15
         lowestWhiteKey = KeyboardLayout.whiteIndex(of: 53)
+        autoZoom = defaults.object(forKey: Keys.autoZoom) == nil ? true : defaults.bool(forKey: Keys.autoZoom)
         recognitionEnabled = defaults.bool(forKey: Keys.recognitionEnabled)
         recognitionServerURL = defaults.string(forKey: Keys.recognitionURL) ?? ""
         // A launch argument can supply the token for automated runs; it isn't persisted.
@@ -254,6 +267,10 @@ final class AppModel {
             let entry = try await library.importFile(at: file, sourceLabel: "Scanned", notes: notes)
             recognitionStatus = .idle
             await select(entry)
+            if isLibraryPresented {
+                isLibraryPresented = false
+                try? await Task.sleep(for: .milliseconds(700))
+            }
             importNotes = notes
             log.info("Recognized \(name, privacy: .public) in \(Int(Date().timeIntervalSince(started)), privacy: .public) s: \(self.lesson.score?.notes.count ?? 0, privacy: .public) notes, warnings=\(result.warnings.map(\.code).joined(separator: ","), privacy: .public)")
         } catch {
@@ -384,7 +401,7 @@ final class AppModel {
     }
 
     func clampedLowestWhite(_ value: Int) -> Int {
-        let highest = KeyboardLayout.highestPianoWhite - visibleWhiteKeys + 1
+        let highest = KeyboardLayout.highestPianoWhite - shownWhiteKeys + 1
         return min(max(value, KeyboardLayout.lowestPianoWhite), max(highest, KeyboardLayout.lowestPianoWhite))
     }
 
@@ -400,14 +417,21 @@ final class AppModel {
 
     /// Leftmost white key that centres `columns` in the visible window.
     private func centeredStart(_ columns: ClosedRange<Int>) -> Int {
-        columns.lowerBound - (visibleWhiteKeys - columns.count) / 2
+        columns.lowerBound - (shownWhiteKeys - columns.count) / 2
     }
 
-    /// Centres the keyboard on the notes the current hand mode needs, if they fit.
+    /// Centres the keyboard on the notes the current hand mode needs, zooming out (up to
+    /// `maxAutoZoomKeys`) when the song is wider than the preferred number of keys.
     func fitKeyboardToSong() {
         let columns = lesson.steps.flatMap { $0.notes.map { Self.whiteColumns(of: $0.midi) } }
-        guard let lowWhite = columns.map(\.lowerBound).min(), let highWhite = columns.map(\.upperBound).max() else { return }
-        if highWhite - lowWhite + 1 <= visibleWhiteKeys {
+        guard let lowWhite = columns.map(\.lowerBound).min(), let highWhite = columns.map(\.upperBound).max() else {
+            songWhiteKeys = nil
+            return
+        }
+        let span = highWhite - lowWhite + 1
+        songWhiteKeys = autoZoom && span > visibleWhiteKeys ? min(span + 1, Self.maxAutoZoomKeys) : nil
+        lowestWhiteKey = clampedLowestWhite(lowestWhiteKey)
+        if span <= shownWhiteKeys {
             lowestWhiteKey = clampedLowestWhite(centeredStart(lowWhite...highWhite))
         } else {
             revealExpectedKeys()
@@ -418,7 +442,7 @@ final class AppModel {
     func revealExpectedKeys() {
         let current = lesson.remainingNotes.map { Self.whiteColumns(of: $0.midi) }
         guard let lowWhite = current.map(\.lowerBound).min(), let highWhite = current.map(\.upperBound).max() else { return }
-        let visibleHigh = lowestWhiteKey + visibleWhiteKeys - 1
+        let visibleHigh = lowestWhiteKey + shownWhiteKeys - 1
         guard lowWhite < lowestWhiteKey || highWhite > visibleHigh else { return }
 
         var rangeLow = lowWhite
@@ -426,7 +450,7 @@ final class AppModel {
         for step in lesson.upcomingSteps(6) {
             for note in step.notes {
                 let columns = Self.whiteColumns(of: note.midi)
-                if max(rangeHigh, columns.upperBound) - min(rangeLow, columns.lowerBound) + 1 <= visibleWhiteKeys {
+                if max(rangeHigh, columns.upperBound) - min(rangeLow, columns.lowerBound) + 1 <= shownWhiteKeys {
                     rangeLow = min(rangeLow, columns.lowerBound)
                     rangeHigh = max(rangeHigh, columns.upperBound)
                 }

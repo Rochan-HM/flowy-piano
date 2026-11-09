@@ -53,6 +53,7 @@ struct SettingsView: View {
                     Stepper(value: $model.visibleWhiteKeys, in: 8...36) {
                         LabeledContent("Visible white keys", value: "\(model.visibleWhiteKeys)")
                     }
+                    Toggle("Zoom out to fit each song", isOn: $model.autoZoom)
                 }
 
                 Section {

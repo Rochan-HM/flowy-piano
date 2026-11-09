@@ -8,7 +8,7 @@ struct PianoKeyboardView: View {
         // Read all model state here rather than inside the GeometryReader closure, where
         // Observation tracking is unreliable and animated changes can be missed.
         let lowestWhite = model.lowestWhiteKey
-        let whiteCount = model.visibleWhiteKeys
+        let whiteCount = model.shownWhiteKeys
         let keys = KeyboardLayout(lowestWhite: lowestWhite, whiteCount: whiteCount, size: .zero).renderedKeys(margin: 7)
         let states = Dictionary(uniqueKeysWithValues: keys.map { ($0, model.keyState(for: $0)) })
         let labels = Dictionary(uniqueKeysWithValues: keys.map { ($0, model.keyLabel(for: $0)) })

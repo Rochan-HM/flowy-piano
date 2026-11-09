@@ -324,12 +324,20 @@ private struct StepColumn: View {
             VStack(spacing: 3) {
                 ForEach(Array(lanes.enumerated()), id: \.offset) { index, hand in
                     let notes = step.notes.filter { $0.hand == hand }.sorted { $0.midi > $1.midi }
-                    VStack(spacing: 2) {
-                        ForEach(notes) { note in
-                            NoteChip(midi: note.midi, spelling: note.spelling, hand: note.hand,
-                                     finger: model.showFingerNumbers ? note.finger : nil,
-                                     style: style(for: note, isCurrent: isCurrent, result: result),
-                                     fontSize: lanes.count == 2 ? 13 : 16)
+                    // Dense chords wrap into columns (highest note top-left) instead of being clipped.
+                    let rowsPerColumn = lanes.count == 2 ? 2 : 3
+                    let columns = stride(from: 0, to: notes.count, by: rowsPerColumn).map { Array(notes[$0..<min(notes.count, $0 + rowsPerColumn)]) }
+                    let fontSize: CGFloat = (lanes.count == 2 ? 13 : 16) - (notes.count > rowsPerColumn ? 2 : 0)
+                    HStack(alignment: .top, spacing: 2) {
+                        ForEach(Array(columns.enumerated()), id: \.offset) { _, column in
+                            VStack(spacing: 2) {
+                                ForEach(column) { note in
+                                    NoteChip(midi: note.midi, spelling: note.spelling, hand: note.hand,
+                                             finger: model.showFingerNumbers ? note.finger : nil,
+                                             style: style(for: note, isCurrent: isCurrent, result: result),
+                                             fontSize: fontSize)
+                                }
+                            }
                         }
                     }
                     .frame(maxHeight: .infinity, alignment: lanes.count == 2 ? (index == 0 ? .bottom : .top) : .center)

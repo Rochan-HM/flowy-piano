@@ -72,9 +72,10 @@ final class SongLibrary {
         guard importService.importer(for: .file(source)) != nil else {
             throw ScoreImportError.unsupportedFile(source.pathExtension)
         }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let fileName = "\(UUID().uuidString.prefix(8))-\(source.lastPathComponent)"
+        // Each import gets its own folder so the original file name (the fallback title) survives.
+        let fileName = "\(UUID().uuidString.prefix(8))/\(source.lastPathComponent)"
         let destination = directory.appendingPathComponent(fileName)
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try await Task.detached(priority: .userInitiated) {
             try Self.coordinatedCopy(from: source, to: destination)
         }.value
@@ -95,7 +96,8 @@ final class SongLibrary {
 
     func delete(_ entry: SongEntry) {
         guard case let .imported(fileName) = entry.origin else { return }
-        try? FileManager.default.removeItem(at: directory.appendingPathComponent(fileName))
+        let file = directory.appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: fileName.contains("/") ? file.deletingLastPathComponent() : file)
         imported.removeAll { $0.id == entry.id }
         saveIndex()
     }
