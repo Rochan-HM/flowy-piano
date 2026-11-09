@@ -35,7 +35,7 @@ All `/v1` endpoints need `Authorization: Bearer $OMR_API_TOKEN`. Errors are
 | `GET /v1/jobs/{id}/musicxml` | The merged MusicXML (`application/vnd.recordare.musicxml+xml`). `409` until the job has succeeded. |
 | `DELETE /v1/jobs/{id}` | Cancels or forgets the job and deletes its files. `204`. |
 
-A page takes 10-25 s on 4 CPU cores, so clients should post with `wait=30`, then repeat
+A page takes 9-17 s on 4 vCPU (15-18 s on 2 vCPU), so clients should post with `wait=30`, then repeat
 `GET /v1/jobs/{id}?wait=30` until `status` is `succeeded` or `failed`.
 
 Job object:
@@ -70,7 +70,7 @@ Job object:
   ],
   "error": null,
   "musicxml_url": "/v1/jobs/d72477bf24de4c1d844780df40368e70/musicxml",
-  "engine": {"name": "homr", "version": "0.7.0+33dd138b0a79"}
+  "engine": {"name": "homr", "version": "0.7.0.post121+33dd138"}
 }
 ```
 
@@ -105,8 +105,8 @@ follow-up requests to the replica that created it (or use a single replica).
 
 ## Deployment
 
-- CPU only; no GPU needed. 2 vCPU / 2 GB RAM works for one user at a time (about 25-35 s per page);
-  4 vCPU / 4 GB gives 10-20 s per page. Add 1.3 GB per extra `OMR_WORKERS`.
+- CPU only; no GPU needed. Measured: 2 vCPU / 2 GB RAM gives 15-18 s per page, 4 vCPU / 4 GB gives
+  9-17 s per page (peak 1.3 GB). Add about 1.3 GB RAM per extra `OMR_WORKERS`.
 - Disk: the image (1.2 GB) plus a few MB per job under `OMR_WORK_DIR`.
 - Put it behind HTTPS (the token is a shared secret) and set a request body limit at the proxy too.
 - homr is AGPL-3.0. It runs unmodified in its own virtualenv and process; if you change homr and
