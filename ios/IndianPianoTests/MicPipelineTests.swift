@@ -82,6 +82,73 @@ final class MicPipelineTests: XCTestCase {
         XCTAssertEqual(onsets, [])
     }
 
+    // MARK: Metronome clicks
+
+    /// The app's own metronome rendered by `SynthCore` (the real click voice and scheduling),
+    /// at `gain` × the level the app plays it, e.g. louder when the phone's speaker is next to its microphone.
+    private func clicks(seconds: Double, interval: Double, beatsPerBar: Int = 4, gain: Float = 1, offset: Double = 0.1) -> [Float] {
+        let core = SynthCore(maxVoices: 4)
+        core.setSampleRate(Float(sampleRate))
+        let base = 10.0
+        for beat in BeatGrid.steadyBeats(interval: interval, beatsPerBar: beatsPerBar, from: 0, to: seconds - offset) {
+            core.enqueue(.click, midi: beat.isDownbeat ? 1 : 0, velocity: 1, at: base + offset + beat.time, group: .metronome)
+        }
+        var signal = [Float](repeating: 0, count: Int(seconds * sampleRate))
+        signal.withUnsafeMutableBufferPointer { buffer in
+            var start = 0
+            while start < buffer.count {
+                let frames = min(512, buffer.count - start)
+                core.render(into: buffer.baseAddress! + start, frames: frames, time: base + Double(start) / sampleRate)
+                start += frames
+            }
+        }
+        return signal.map { $0 * gain }
+    }
+
+    private func mix(_ a: [Float], _ b: [Float]) -> [Float] {
+        var sum = a + [Float](repeating: 0, count: max(0, b.count - a.count))
+        for index in b.indices { sum[index] += b[index] }
+        return sum
+    }
+
+    private static let triads: [Set<Int>] = (0..<12).flatMap { (root: Int) -> [Set<Int>] in
+        [[root, (root + 4) % 12, (root + 7) % 12], [root, (root + 3) % 12, (root + 7) % 12]]
+    }
+
+    func testMetronomeClicksAreNotHeardAsNotesOrChords() {
+        for gain: Float in [1, 4] {
+            let results = analyze(clicks(seconds: 4, interval: 0.5, gain: gain))
+            XCTAssertGreaterThan(results.map(\.rms).max() ?? 0, 0.01, "clicks at \(gain)x should be above the noise gate")
+            XCTAssertEqual(results.compactMap(\.noteOnset), [], "clicks at \(gain)x")
+            XCTAssertEqual(results.filter(\.isAttack).count, 0, "clicks at \(gain)x were taken for key strikes")
+            // Chords are only matched on chroma shortly after a strike (what reaches the lesson).
+            let chordFrames = results.filter { $0.framesSinceAttack <= MicAnalyzer.onsetChromaFrames }.compactMap(\.chroma)
+                .filter { chroma in Self.triads.contains { ChromaAnalyzer.matches(chroma, expected: $0) } }
+            XCTAssertEqual(chordFrames.count, 0, "clicks at \(gain)x looked like a chord")
+        }
+    }
+
+    func testClicksOverAPerformanceAddNoOnsets() {
+        let notes = [60, 64, 67, 60, 60, 72]
+        let piano = performance(notes.map { [$0] })
+        for gain: Float in [1, 3] {
+            // 112 bpm, unrelated to the notes, so clicks land on strikes, decays and silences.
+            let signal = mix(piano, clicks(seconds: Double(piano.count) / sampleRate, interval: 60.0 / 112, gain: gain, offset: 0.37))
+            XCTAssertEqual(analyze(signal).compactMap(\.noteOnset), notes, "clicks at \(gain)x")
+        }
+    }
+
+    func testClicksDuringAHeldNoteDoNotRepeatIt() {
+        // A held C4 decaying from mezzo-forte to quiet, the metronome ticking over it.
+        for (amplitude, gain): (Double, Float) in [(0.22, 1), (0.22, 3), (0.06, 1), (0.06, 3)] {
+            let count = Int(3 * sampleRate)
+            let note = PitchDetectionTests.tone(PitchDetectionTests.midiFrequency(60), sampleRate: sampleRate, count: count,
+                                                weights: overtones, amplitude: amplitude, decay: 1.2)
+            let signal = mix(note, clicks(seconds: 3, interval: 0.5, gain: gain, offset: 0.25))
+            XCTAssertEqual(analyze(signal).compactMap(\.noteOnset), [60], "note amplitude \(amplitude), clicks at \(gain)x")
+        }
+    }
+
     @MainActor
     func testMicrophonePerformanceDrivesTheTwinkleLesson() async throws {
         let url = try XCTUnwrap(Bundle.main.url(forResource: "twinkle-twinkle", withExtension: "musicxml"))

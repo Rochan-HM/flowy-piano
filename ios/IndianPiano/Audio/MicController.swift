@@ -19,6 +19,14 @@ final class MicController {
     private(set) var level: Float = 0
     private(set) var heardNote: Int?
     private(set) var heardPitchClasses: [Int] = []
+    /// Drops readings while set, e.g. while the app plays the song itself.
+    var isPaused = false {
+        didSet {
+            guard isPaused != oldValue else { return }
+            heardNote = nil
+            heardPitchClasses = []
+        }
+    }
 
     /// (MIDI note, ID of the key strike it came from).
     @ObservationIgnored var onNote: ((Int, Int) -> Void)?
@@ -136,6 +144,7 @@ final class MicController {
         let decibels = 20 * log10(max(result.rms, 1e-6))
         let normalized = max(0, min(1, (decibels + 60) / 60))
         level = max(normalized, level * 0.85)
+        guard !isPaused else { return }
 
         if let note = result.noteOnset {
             heardNote = note

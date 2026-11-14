@@ -8,6 +8,8 @@ import Foundation
 struct NoteOnsetTracker {
     var gateRMS: Float = 0.01
     var attackRatio: Float = 1.6
+    /// A strike's attack level must also reach this fraction of the gate.
+    var attackFloor: Float = 0.5
     var stableFrames = 2
     var minimumConfidence = 0.8
 
@@ -26,9 +28,12 @@ struct NoteOnsetTracker {
     private(set) var attackCount = 0
     private(set) var framesSinceAttack = 1_000
 
-    mutating func process(_ estimate: PitchEstimate?, rms: Float) -> Int? {
+    /// `attackRMS` is the level that decides key strikes (by default `rms`); `MicAnalyzer` passes
+    /// the level below ~1.5 kHz so the metronome's high click can't pass for a strike.
+    mutating func process(_ estimate: PitchEstimate?, rms: Float, attackRMS: Float? = nil) -> Int? {
+        let strike = attackRMS ?? rms
         defer {
-            recentRMS.append(rms)
+            recentRMS.append(strike)
             if recentRMS.count > 3 { recentRMS.removeFirst() }
         }
         lastFrameWasAttack = false
@@ -41,8 +46,8 @@ struct NoteOnsetTracker {
         // Over notes that are still ringing, a strike's loudness rises across two or three frames,
         // so compare with the quietest recent frame; the refractory period stops one strike counting twice.
         let quietestRecent = recentRMS.min() ?? 0
-        let stillRising = rms > (recentRMS.last ?? 0) * 1.1
-        if rms > gateRMS && rms > quietestRecent * attackRatio && stillRising && framesSinceAttack >= 3 {
+        let stillRising = strike > (recentRMS.last ?? 0) * 1.1
+        if rms > gateRMS && strike > gateRMS * attackFloor && strike > quietestRecent * attackRatio && stillRising && framesSinceAttack >= 3 {
             lastFrameWasAttack = true
             attackCount += 1
             framesSinceAttack = 0
