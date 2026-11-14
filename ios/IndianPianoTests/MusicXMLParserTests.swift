@@ -128,6 +128,23 @@ final class MusicXMLParserTests: XCTestCase {
         XCTAssertEqual(notes.map(\.measure), [1, 2])
     }
 
+    func testPickupBarIsMeasuredSoBeatsLandOnTheBar() throws {
+        let xml = """
+        <score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        <part id="P1">
+          <measure number="0" implicit="yes"><attributes><divisions>1</divisions><time><beats>3</beats><beat-type>4</beat-type></time></attributes>
+            <note><pitch><step>G</step><octave>4</octave></pitch><duration>1</duration></note></measure>
+          <measure number="1"><note><pitch><step>C</step><octave>5</octave></pitch><duration>3</duration></note></measure>
+        </part></score-partwise>
+        """
+        let score = try parse(xml)
+        XCTAssertEqual(score.pickupBeats, 1)
+        XCTAssertEqual(score.notes.map(\.onsetBeats), [0, 1])
+        let downbeats = BeatGrid(score: score).beats(from: 0, to: 2, tempoScale: 1).filter(\.isDownbeat)
+        XCTAssertEqual(downbeats.map(\.time), [score.notes[1].onsetSeconds])
+        XCTAssertEqual(try parse(Self.grandStaff).pickupBeats, 0)
+    }
+
     func testRejectsNonScores() {
         XCTAssertThrowsError(try parse("<html><body/></html>"))
         XCTAssertThrowsError(try parse("not xml at all <"))

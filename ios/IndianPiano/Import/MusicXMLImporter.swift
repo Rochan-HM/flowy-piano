@@ -83,6 +83,7 @@ enum MusicXMLParser {
 
         var tempos: [TempoChange] = []
         var timeSignature: TimeSignature?
+        var pickupBeats = 0.0
         var keyFifths: Int?
         var infos: [PartInfo] = []
 
@@ -178,7 +179,10 @@ enum MusicXMLParser {
                 }
 
                 if maxPosition <= 0, let timeSignature {
-                    maxPosition = Double(timeSignature.beats) * 4 / Double(timeSignature.beatType)
+                    maxPosition = timeSignature.barLength
+                }
+                if partIndex == 0, measureStart == 0, let timeSignature, maxPosition < timeSignature.barLength - 1e-6 {
+                    pickupBeats = maxPosition
                 }
                 measureStart += maxPosition
             }
@@ -196,6 +200,7 @@ enum MusicXMLParser {
             notes: practiced.flatMap(\.notes),
             tempoMap: TempoMap(tempos),
             timeSignature: timeSignature ?? TimeSignature(beats: 4, beatType: 4),
+            pickupBeats: pickupBeats,
             keyFifths: keyFifths,
             sourceFormat: "MusicXML"
         )

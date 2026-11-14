@@ -50,7 +50,9 @@ struct TempoMap: Sendable {
         self.changes = deduped
     }
 
+    /// Negative beats (a count-in before the music) continue at the initial tempo.
     func seconds(atBeat beat: Double) -> Double {
+        if beat < 0 { return beat * 60 / initialBPM }
         var seconds = 0.0
         for (index, change) in changes.enumerated() {
             let end = index + 1 < changes.count ? changes[index + 1].beat : .infinity
@@ -60,6 +62,22 @@ struct TempoMap: Sendable {
             if beat <= end { break }
         }
         return seconds
+    }
+
+    /// Inverse of `seconds(atBeat:)`.
+    func beat(atSeconds seconds: Double) -> Double {
+        var elapsed = 0.0
+        for (index, change) in changes.enumerated() {
+            let end = index + 1 < changes.count ? changes[index + 1].beat : .infinity
+            let span = (end - change.beat) * 60 / change.bpm
+            if seconds <= elapsed + span { return change.beat + (seconds - elapsed) * change.bpm / 60 }
+            elapsed += span
+        }
+        return seconds * initialBPM / 60
+    }
+
+    func bpm(atBeat beat: Double) -> Double {
+        changes.last { $0.beat <= beat }?.bpm ?? initialBPM
     }
 
     var initialBPM: Double { changes.first?.bpm ?? 100 }
@@ -73,6 +91,8 @@ struct Score: Identifiable, Sendable {
     var notes: [ScoreNote]
     var tempoMap: TempoMap
     var timeSignature = TimeSignature(beats: 4, beatType: 4)
+    /// Length of an incomplete first bar (anacrusis) in quarter notes; 0 when the music starts on a downbeat.
+    var pickupBeats: Double = 0
     var keyFifths: Int?
     /// Human-readable source format, e.g. "MusicXML" or "MIDI".
     var sourceFormat: String
@@ -101,4 +121,13 @@ struct Score: Identifiable, Sendable {
 struct TimeSignature: Hashable, Sendable {
     var beats: Int
     var beatType: Int
+
+    /// Bar length in quarter notes.
+    var barLength: Double { Double(beats) * 4 / Double(beatType) }
+
+    /// The counted beat: dotted quarters in compound metres (6/8, 9/8, 12/8), otherwise the written beat.
+    var pulse: (perBar: Int, length: Double) {
+        if beatType >= 8, beats > 3, beats % 3 == 0 { return (beats / 3, 12 / Double(beatType)) }
+        return (max(1, beats), 4 / Double(beatType))
+    }
 }
