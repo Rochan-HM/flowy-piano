@@ -8,6 +8,8 @@ import QuartzCore
 /// * Tempo mode: a playhead runs at a fraction of the written tempo; notes played within the hit
 ///   window count, notes the playhead passes count as missed. The hand you're not practising can
 ///   be played by the app as accompaniment.
+/// * Listen mode: the app plays the song from the current step at the same speed, lighting the
+///   keys as they sound. Input isn't graded; stopping returns to the step the demo started from.
 @MainActor
 @Observable
 final class LessonEngine {
@@ -39,10 +41,16 @@ final class LessonEngine {
     }
 
     enum PracticeMode: String, CaseIterable, Identifiable {
-        case wait, tempo
+        case wait, tempo, listen
 
         var id: String { rawValue }
-        var title: String { self == .wait ? "Wait" : "Tempo" }
+        var title: String {
+            switch self {
+            case .wait: return "Wait"
+            case .tempo: return "Tempo"
+            case .listen: return "Listen"
+            }
+        }
     }
 
     enum InputSource: Equatable {
@@ -85,10 +93,15 @@ final class LessonEngine {
         didSet { if handMode != oldValue { rebuildSteps() } }
     }
     var practiceMode: PracticeMode = .wait {
-        didSet { if practiceMode != oldValue { restart() } }
+        didSet {
+            guard practiceMode != oldValue else { return }
+            if practiceMode == .listen || oldValue == .listen { keepPlaceAfterSwitchingMode() } else { restart() }
+        }
     }
-    /// Playback speed in tempo mode as a fraction of the written tempo.
+    /// Playback speed in tempo and listen mode as a fraction of the written tempo.
     var tempoScale: Double = 0.7
+    /// Whether Listen mode also plays the hand that isn't being practised (softer).
+    var listenWithOtherHand = true
 
     private(set) var steps: [Step] = []
     private(set) var currentIndex = 0
@@ -101,19 +114,39 @@ final class LessonEngine {
     private(set) var missedCount = 0
     private(set) var isPlaying = false
     private(set) var playhead: TimeInterval = 0
+    /// Listen mode: the step the demo started from, while it plays or is paused.
+    private(set) var demoOrigin: Int?
+    /// Listen mode: notes of the practised hands sounding at the playhead.
+    private(set) var soundingNotes: [ScoreNote] = []
 
     let leadIn: TimeInterval = 2
+    let demoLeadIn: TimeInterval = 1
     let hitWindow: TimeInterval = 0.4
+    /// How far ahead demo notes go to the synth, which starts them on their exact sample.
+    static let scheduleAhead: TimeInterval = 0.15
 
     @ObservationIgnored var clock: () -> TimeInterval = { CACurrentMediaTime() }
     /// Called in tempo mode for notes of the hand that isn't being practised: (note, duration).
     @ObservationIgnored var onAccompaniment: ((ScoreNote, TimeInterval) -> Void)?
+    /// Called in listen mode, up to `scheduleAhead` early, with each note on/off and its clock time.
+    @ObservationIgnored var onDemoEvent: ((DemoEvent, TimeInterval) -> Void)?
+    /// Called when a demo stops or pauses: notes handed over but not yet started must be dropped.
+    @ObservationIgnored var onDemoStop: (() -> Void)?
     @ObservationIgnored var onStepChanged: (() -> Void)?
+    @ObservationIgnored var onPlaybackChanged: (() -> Void)?
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var playStart: TimeInterval = 0
     @ObservationIgnored private var accompaniment: [ScoreNote] = []
     @ObservationIgnored private var accompanimentCursor = 0
     @ObservationIgnored private var stepHadMistake = false
+    @ObservationIgnored private var notesByID: [Int: ScoreNote] = [:]
+    @ObservationIgnored private var demoEvents: [DemoEvent] = []
+    @ObservationIgnored private var demoScheduleCursor = 0
+    @ObservationIgnored private var demoVisualCursor = 0
+    @ObservationIgnored private var soundingIDs: Set<Int> = []
+
+    /// Clock time of the start of the song while playing, e.g. for the metronome.
+    var songStartTime: TimeInterval? { isPlaying ? playStart : nil }
 
     var currentStep: Step? { steps.indices.contains(currentIndex) ? steps[currentIndex] : nil }
     var isFinished: Bool { !steps.isEmpty && currentIndex >= steps.count }
@@ -136,6 +169,7 @@ final class LessonEngine {
     func load(_ score: Score?) {
         stopPlayback()
         self.score = score
+        notesByID = Dictionary((score?.notes ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         if let score, handMode.hands.isDisjoint(with: score.hands) {
             handMode = score.hands.contains(.right) ? .right : .left
         }
@@ -178,6 +212,7 @@ final class LessonEngine {
 
     func restart() {
         stopPlayback()
+        demoOrigin = nil
         currentIndex = 0
         satisfiedNoteIDs = []
         results = [:]
@@ -191,11 +226,29 @@ final class LessonEngine {
         onStepChanged?()
     }
 
+    /// Switching to or from Listen keeps the step (where the demo started), so the learner can
+    /// practise the passage they just heard.
+    private func keepPlaceAfterSwitchingMode() {
+        stopPlayback()
+        if let origin = demoOrigin, steps.indices.contains(origin) { currentIndex = origin }
+        demoOrigin = nil
+        if isFinished {
+            restart()
+            return
+        }
+        satisfiedNoteIDs = []
+        stepHadMistake = false
+        feedback = nil
+        playhead = (currentStep.map(stepTime) ?? 0) - leadIn
+        syncAccompanimentCursor()
+        onStepChanged?()
+    }
+
     // MARK: - Input
 
     @discardableResult
     func handle(midi: Int, source: InputSource, octaveTolerant: Bool = false) -> InputResult {
-        guard let step = currentStep else { return .ignored }
+        guard let step = currentStep, practiceMode != .listen else { return .ignored }
         if practiceMode == .tempo && !isPlaying { return .ignored }
 
         let remaining = remainingNotes
@@ -241,7 +294,7 @@ final class LessonEngine {
     /// Microphone chord recognition for steps with several pitch classes.
     @discardableResult
     func handleChroma(_ chroma: [Float]) -> Bool {
-        guard let step = currentStep, !(practiceMode == .tempo && !isPlaying) else { return false }
+        guard let step = currentStep, practiceMode != .listen, !(practiceMode == .tempo && !isPlaying) else { return false }
         let expected = Set(step.notes.map { MIDINote.pitchClass($0.midi) })
         guard expected.count > 1, ChromaAnalyzer.matches(chroma, expected: expected) else { return false }
         let remaining = remainingNotes
@@ -273,7 +326,7 @@ final class LessonEngine {
     }
 
     func registerWrong(played midi: Int) {
-        guard currentStep != nil, !(practiceMode == .tempo && !isPlaying) else { return }
+        guard currentStep != nil, practiceMode != .listen, !(practiceMode == .tempo && !isPlaying) else { return }
         wrongCount += 1
         stepHadMistake = true
         setFeedback(.wrong(played: midi, expected: remainingNotes))
@@ -287,11 +340,19 @@ final class LessonEngine {
 
     func skipStep() {
         guard currentStep != nil else { return }
-        moveToNextStep()
+        if practiceMode == .listen {
+            if currentIndex + 1 < steps.count { seekDemo { currentIndex += 1 } }
+        } else {
+            moveToNextStep()
+        }
     }
 
     func previousStep() {
         guard currentIndex > 0 else { return }
+        if practiceMode == .listen {
+            seekDemo { currentIndex -= 1 }
+            return
+        }
         stopPlayback()
         currentIndex -= 1
         results[currentIndex] = nil
@@ -299,7 +360,18 @@ final class LessonEngine {
         stepHadMistake = false
         feedback = nil
         playhead = (steps[currentIndex].time / tempoScale) - leadIn
+        syncAccompanimentCursor()
         onStepChanged?()
+    }
+
+    /// Moves to another step in listen mode; a playing demo carries on from there.
+    private func seekDemo(_ move: () -> Void) {
+        let resume = isPlaying
+        stopPlayback()
+        demoOrigin = nil
+        move()
+        onStepChanged?()
+        if resume { play() }
     }
 
     private func completeStep() {
@@ -323,15 +395,20 @@ final class LessonEngine {
         feedbackCount += 1
     }
 
-    // MARK: - Tempo mode
+    // MARK: - Tempo and listen mode
 
     func stepTime(_ step: Step) -> TimeInterval { step.time / tempoScale }
 
     func togglePlayback() { isPlaying ? stopPlayback() : play() }
 
+    /// Starts tempo mode, or the demo in listen mode: from the current step, or from where it was paused.
     func play() {
-        guard practiceMode == .tempo, !steps.isEmpty else { return }
-        if isFinished { restart() }
+        guard practiceMode != .wait, !steps.isEmpty, !isPlaying else { return }
+        if practiceMode == .listen {
+            prepareDemo()
+        } else if isFinished {
+            restart()
+        }
         isPlaying = true
         playStart = clock() - playhead
         let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
@@ -339,19 +416,76 @@ final class LessonEngine {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+        onPlaybackChanged?()
+        if practiceMode == .listen { advancePlayhead(to: playhead) }
     }
 
+    /// Stops the playhead where it is (a pause in listen mode: `play()` resumes the demo).
     func stopPlayback() {
         timer?.invalidate()
         timer = nil
+        soundingIDs = []
+        if !soundingNotes.isEmpty { soundingNotes = [] }
+        guard isPlaying else { return }
+        if !demoEvents.isEmpty {
+            playhead = clock() - playStart
+            demoEvents = []
+            onDemoStop?()
+        }
         isPlaying = false
+        onPlaybackChanged?()
+    }
+
+    /// Ends the demo and goes back to the step it started from.
+    func stopDemo() {
+        stopPlayback()
+        guard let origin = demoOrigin else { return }
+        demoOrigin = nil
+        if steps.indices.contains(origin) { currentIndex = origin }
+        onStepChanged?()
+    }
+
+    /// Changes the speed, keeping the musical position; a playing demo carries on at the new speed.
+    func changeTempoScale(to scale: Double) {
+        let resume = practiceMode == .listen && isPlaying
+        stopPlayback()
+        if playhead > 0 { playhead *= tempoScale / scale }
+        tempoScale = scale
+        syncAccompanimentCursor()
+        if resume { play() }
+    }
+
+    private func prepareDemo() {
+        if isFinished {
+            currentIndex = 0
+            demoOrigin = nil
+        }
+        let start: TimeInterval
+        if let origin = demoOrigin {
+            start = max(playhead, stepTime(steps[origin]))
+        } else {
+            demoOrigin = currentIndex
+            start = stepTime(steps[currentIndex])
+            playhead = start - demoLeadIn
+        }
+        demoEvents = DemoSchedule.events(notes: score?.notes ?? [], hands: handMode.hands, accompaniment: listenWithOtherHand,
+                                         tempoScale: tempoScale, from: start)
+        demoScheduleCursor = 0
+        demoVisualCursor = 0
+        soundingIDs = []
+    }
+
+    private func syncAccompanimentCursor() {
+        accompanimentCursor = accompaniment.firstIndex { $0.onsetSeconds / tempoScale >= playhead } ?? accompaniment.count
     }
 
     private func tick() { advancePlayhead(to: clock() - playStart) }
 
-    /// Moves the tempo-mode playhead, marking passed steps as missed and firing accompaniment.
+    /// Moves the playhead. Tempo mode marks passed steps as missed and fires accompaniment;
+    /// listen mode hands upcoming notes to the synth and follows along.
     func advancePlayhead(to time: TimeInterval) {
         playhead = time
+        if practiceMode == .listen { return advanceDemo(to: time) }
         while let step = currentStep, time > stepTime(step) + hitWindow {
             results[currentIndex] = satisfiedNoteIDs.isEmpty ? .missed : .withMistakes
             missedCount += 1
@@ -364,5 +498,36 @@ final class LessonEngine {
             onAccompaniment?(note, note.durationSeconds / tempoScale)
             accompanimentCursor += 1
         }
+    }
+
+    private func advanceDemo(to time: TimeInterval) {
+        guard isPlaying else { return }
+        while demoScheduleCursor < demoEvents.count, demoEvents[demoScheduleCursor].time <= time + Self.scheduleAhead {
+            let event = demoEvents[demoScheduleCursor]
+            onDemoEvent?(event, playStart + event.time)
+            demoScheduleCursor += 1
+        }
+
+        var soundingChanged = false
+        while demoVisualCursor < demoEvents.count, demoEvents[demoVisualCursor].time <= time {
+            let event = demoEvents[demoVisualCursor]
+            if !event.isAccompaniment {
+                if event.kind == .noteOn { soundingIDs.insert(event.noteID) } else { soundingIDs.remove(event.noteID) }
+                soundingChanged = true
+            }
+            demoVisualCursor += 1
+        }
+        if soundingChanged {
+            soundingNotes = soundingIDs.compactMap { notesByID[$0] }.sorted { $0.midi < $1.midi }
+        }
+
+        var stepChanged = false
+        while currentIndex + 1 < steps.count, stepTime(steps[currentIndex + 1]) <= time {
+            currentIndex += 1
+            stepChanged = true
+        }
+        if stepChanged { onStepChanged?() }
+
+        if demoVisualCursor >= demoEvents.count { stopDemo() }
     }
 }

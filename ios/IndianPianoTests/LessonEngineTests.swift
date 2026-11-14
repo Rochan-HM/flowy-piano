@@ -196,4 +196,203 @@ final class LessonEngineTests: XCTestCase {
         engine.previousStep()
         XCTAssertEqual(engine.currentIndex, 0)
     }
+
+    // MARK: - Listen mode
+
+    private struct Handed: Equatable {
+        var midi: Int
+        var on: Bool
+        var at: TimeInterval
+        var soft = false
+    }
+
+    /// A listen-mode engine on a fake clock, recording the notes it hands to the synth.
+    private func makeListener(_ mode: LessonEngine.HandMode, speed: Double = 1, otherHand: Bool = false,
+                              now: @escaping () -> TimeInterval) -> (LessonEngine, () -> [Handed], () -> Int) {
+        let engine = makeEngine(mode, practice: .listen)
+        engine.tempoScale = speed
+        engine.listenWithOtherHand = otherHand
+        engine.clock = now
+        var handed: [Handed] = []
+        var stops = 0
+        engine.onDemoEvent = { event, time in
+            handed.append(Handed(midi: event.midi, on: event.kind == .noteOn, at: (time * 1000).rounded() / 1000,
+                                 soft: event.kind == .noteOn && event.velocity < DemoSchedule.velocity))
+        }
+        engine.onDemoStop = { stops += 1 }
+        addTeardownBlock { engine.stopPlayback() }
+        return (engine, { handed }, { stops })
+    }
+
+    func testListenPlaysFromTheCurrentStepAndFollowsAlong() {
+        var now = 100.0
+        let (engine, handed, stops) = makeListener(.right, speed: 0.5) { now }
+        engine.skipStep()
+        engine.play()
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertEqual(engine.demoOrigin, 1)
+        // D4 is at 2 s at half speed, after a one-second lead-in.
+        XCTAssertEqual(engine.playhead, 2 - engine.demoLeadIn, accuracy: 1e-9)
+        XCTAssertEqual(handed(), [])
+
+        now = 100.9
+        engine.advancePlayhead(to: 1.9)
+        XCTAssertEqual(handed(), [Handed(midi: 62, on: true, at: 101)], "handed over ahead of time, at its exact clock time")
+        XCTAssertEqual(engine.soundingNotes, [])
+
+        engine.advancePlayhead(to: 2.01)
+        XCTAssertEqual(engine.soundingNotes.map(\.midi), [62])
+        XCTAssertEqual(engine.soundingNotes.first?.finger, 2)
+        XCTAssertEqual(engine.currentIndex, 1)
+
+        engine.advancePlayhead(to: 4.01)
+        XCTAssertEqual(engine.soundingNotes.map(\.midi), [64, 67])
+        XCTAssertEqual(engine.currentIndex, 2)
+
+        now = 105.5
+        engine.advancePlayhead(to: 6.5)
+        XCTAssertEqual(handed(), [Handed(midi: 62, on: true, at: 101), Handed(midi: 62, on: false, at: 103),
+                                  Handed(midi: 64, on: true, at: 103), Handed(midi: 67, on: true, at: 103),
+                                  Handed(midi: 64, on: false, at: 105), Handed(midi: 67, on: false, at: 105)])
+        XCTAssertFalse(engine.isPlaying, "stops at the end of the song")
+        XCTAssertEqual(engine.currentIndex, 1, "and goes back to where the demo started")
+        XCTAssertNil(engine.demoOrigin)
+        XCTAssertEqual(engine.soundingNotes, [])
+        XCTAssertEqual(stops(), 1)
+    }
+
+    func testListenPlaysTheOtherHandSofterWithoutLightingIt() {
+        var now = 100.0
+        let (engine, handed, _) = makeListener(.right, otherHand: true) { now }
+        engine.play()
+        now = 101
+        engine.advancePlayhead(to: 0)
+        XCTAssertEqual(handed(), [Handed(midi: 48, on: true, at: 101, soft: true), Handed(midi: 60, on: true, at: 101)])
+        XCTAssertEqual(engine.soundingNotes.map(\.midi), [60])
+    }
+
+    func testListenWithBothHandsLightsBoth() {
+        var now = 100.0
+        let (engine, handed, _) = makeListener(.both, otherHand: true) { now }
+        engine.play()
+        now = 101
+        engine.advancePlayhead(to: 0)
+        XCTAssertEqual(handed(), [Handed(midi: 48, on: true, at: 101), Handed(midi: 60, on: true, at: 101)])
+        XCTAssertEqual(engine.soundingNotes.map(\.midi), [48, 60])
+        XCTAssertEqual(engine.soundingNotes.map(\.hand), [.left, .right])
+    }
+
+    func testPausingAndResumingNeitherRepeatsNorSkipsNotes() {
+        var now = 100.0
+        let (engine, handed, stops) = makeListener(.right) { now }
+        engine.play()
+        now = 101.9
+        engine.advancePlayhead(to: 0.9)
+        XCTAssertEqual(handed(), [Handed(midi: 60, on: true, at: 101), Handed(midi: 60, on: false, at: 102),
+                                  Handed(midi: 62, on: true, at: 102)])
+
+        engine.togglePlayback()
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertEqual(stops(), 1, "notes handed over but not yet started are dropped")
+        XCTAssertEqual(engine.playhead, 0.9, accuracy: 1e-9)
+        XCTAssertEqual(engine.demoOrigin, 0)
+        XCTAssertEqual(engine.soundingNotes, [])
+
+        now = 200
+        engine.togglePlayback()
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertEqual(handed().dropFirst(3), [Handed(midi: 62, on: true, at: 200.1)], "carries on where it paused")
+        XCTAssertEqual(handed().filter { $0.midi == 60 && $0.on }.count, 1)
+
+        engine.stopDemo()
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertEqual(engine.currentIndex, 0)
+        XCTAssertNil(engine.demoOrigin)
+    }
+
+    func testStopGoesBackToWhereTheDemoStartedAndPlayStartsThereAgain() {
+        var now = 100.0
+        let (engine, handed, _) = makeListener(.right) { now }
+        engine.skipStep()
+        engine.play()
+        now = 103.1
+        engine.advancePlayhead(to: 2.1)
+        XCTAssertEqual(engine.currentIndex, 2)
+        engine.stopDemo()
+        XCTAssertEqual(engine.currentIndex, 1)
+
+        now = 300
+        engine.play()
+        XCTAssertEqual(engine.playhead, 1 - engine.demoLeadIn, accuracy: 1e-9)
+        engine.advancePlayhead(to: 0.9)
+        XCTAssertEqual(handed().last, Handed(midi: 62, on: true, at: 301))
+    }
+
+    func testListenIgnoresInput() {
+        var now = 100.0
+        let (engine, _, _) = makeListener(.right) { now }
+        XCTAssertEqual(engine.handle(midi: 60, source: .touch), .ignored)
+        engine.play()
+        now = 101
+        engine.advancePlayhead(to: 0)
+        XCTAssertEqual(engine.handle(midi: 60, source: .microphone), .ignored)
+        XCTAssertEqual(engine.handle(midi: 61, source: .touch), .ignored)
+        engine.registerWrong(played: 61)
+        XCTAssertFalse(engine.handleChroma([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0]))
+        XCTAssertEqual(engine.correctCount + engine.wrongCount + engine.missedCount, 0)
+        XCTAssertNil(engine.feedback)
+    }
+
+    func testSwitchingModesKeepsThePlaceOfTheDemo() {
+        var now = 100.0
+        let (engine, _, _) = makeListener(.right) { now }
+        engine.skipStep()
+        engine.play()
+        now = 103.1
+        engine.advancePlayhead(to: 2.1)
+        engine.practiceMode = .wait
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertEqual(engine.currentIndex, 1, "practise the passage just heard")
+        XCTAssertEqual(engine.handle(midi: 62, source: .touch), .correct(completedStep: true))
+
+        engine.practiceMode = .listen
+        XCTAssertEqual(engine.currentIndex, 2)
+        engine.practiceMode = .tempo
+        XCTAssertEqual(engine.currentIndex, 2)
+        engine.practiceMode = .wait
+        XCTAssertEqual(engine.currentIndex, 0, "wait and tempo still restart")
+    }
+
+    func testChangingSpeedKeepsTheDemoGoing() {
+        var now = 100.0
+        let (engine, handed, _) = makeListener(.right) { now }
+        engine.play()
+        now = 102.5
+        engine.advancePlayhead(to: 1.5)
+        XCTAssertEqual(engine.currentIndex, 1)
+
+        engine.changeTempoScale(to: 0.5)
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertEqual(engine.tempoScale, 0.5)
+        XCTAssertEqual(engine.playhead, 3, accuracy: 1e-9, "the same place in the music at half speed")
+        XCTAssertEqual(engine.currentIndex, 1)
+        XCTAssertEqual(engine.demoOrigin, 0)
+
+        now = 103.4
+        engine.advancePlayhead(to: 3.9)
+        XCTAssertEqual(handed().suffix(2), [Handed(midi: 64, on: true, at: 103.5), Handed(midi: 67, on: true, at: 103.5)])
+    }
+
+    func testSkippingDuringADemoCarriesOnFromTheNewStep() {
+        var now = 100.0
+        let (engine, handed, _) = makeListener(.right) { now }
+        engine.play()
+        engine.skipStep()
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertEqual(engine.currentIndex, 1)
+        XCTAssertEqual(engine.demoOrigin, 1)
+        now = 101
+        engine.advancePlayhead(to: 1)
+        XCTAssertEqual(handed().last, Handed(midi: 62, on: true, at: 101))
+    }
 }
