@@ -111,6 +111,36 @@ final class IndianPianoUITests: XCTestCase {
         waitFor(stats, labelContaining: "1 mistakes")
     }
 
+    func testListenModeAndMetronome() {
+        let app = launch(["-song", "twinkle", "-handMode", "right", "-practiceMode", "listen", "-notation", "western",
+                          "-showFingers", "YES", "-tempoScale", "1", "-metronome", "NO"])
+        let feedback = app.descendants(matching: .any).matching(identifier: "feedback").firstMatch
+        XCTAssertTrue(feedback.waitForExistence(timeout: 20))
+        waitFor(feedback, labelContaining: "Press play to hear it at 100%")
+
+        let metronome = app.buttons["metronomeButton"]
+        XCTAssertEqual(metronome.value as? String, "Off")
+        // Leave the saved setting as it was.
+        addTeardownBlock { if metronome.exists, metronome.value as? String != "Off" { metronome.tap() } }
+        metronome.tap()
+        let on = XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "On, 92 beats per minute"),
+                                                                  object: metronome)], timeout: 5)
+        XCTAssertEqual(on, .completed, "metronome value is “\(metronome.value ?? "")”")
+
+        let play = app.buttons["playButton"]
+        play.tap()
+        waitFor(feedback, labelContaining: "Playing")
+        // The sounding notes are named with their fingers as the song plays.
+        waitFor(feedback, labelContaining: "finger")
+        play.tap()
+        waitFor(feedback, labelContaining: "Paused")
+        play.tap()
+        waitFor(feedback, labelContaining: "Playing")
+        app.buttons["stopButton"].tap()
+        waitFor(feedback, labelContaining: "Press play")
+        XCTAssertFalse(app.buttons["stopButton"].isEnabled)
+    }
+
     func testHandModeSwitchShowsLeftHandNotes() {
         let app = launch(["-song", "twinkle", "-handMode", "right", "-notation", "western", "-practiceMode", "wait"])
         let feedback = app.descendants(matching: .any).matching(identifier: "feedback").firstMatch

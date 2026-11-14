@@ -5,26 +5,33 @@ struct LessonPanel: View {
 
     var body: some View {
         let lesson = model.lesson
+        let isListening = lesson.practiceMode == .listen
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 Picker("Practice mode", selection: Binding(get: { lesson.practiceMode }, set: { model.setPracticeMode($0) })) {
                     ForEach(LessonEngine.PracticeMode.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 120)
+                .frame(width: 180)
                 .accessibilityIdentifier("practiceMode")
 
-                if lesson.practiceMode == .tempo { TempoControls() }
+                // Wait mode has no playhead, but the speed still sets the metronome's pulse.
+                if lesson.practiceMode != .wait || model.metronomeEnabled {
+                    TempoControls(showsTransport: lesson.practiceMode != .wait)
+                }
 
                 FeedbackBanner()
                     .frame(maxWidth: .infinity)
                     .layoutPriority(1)
 
-                StatsView()
-                IconButton(systemName: "speaker.wave.2.fill", label: "Hear the next notes") { model.playExpected() }
+                if !isListening { StatsView() }
+                MetronomeButton()
+                if !isListening {
+                    IconButton(systemName: "speaker.wave.2.fill", label: "Hear the next notes") { model.playExpected() }
+                }
                 IconButton(systemName: "backward.fill", label: "Previous step") { lesson.previousStep() }
                 IconButton(systemName: "forward.fill", label: "Skip step") { lesson.skipStep() }
-                IconButton(systemName: "arrow.counterclockwise", label: "Restart") { lesson.restart() }
+                IconButton(systemName: "arrow.counterclockwise", label: "Restart") { model.restartLesson() }
             }
             .frame(height: 30)
 
@@ -42,18 +49,34 @@ struct LessonPanel: View {
 
 private struct TempoControls: View {
     @Environment(AppModel.self) private var model
+    var showsTransport: Bool
 
     var body: some View {
         let lesson = model.lesson
         HStack(spacing: 4) {
-            Button { lesson.togglePlayback() } label: {
-                Image(systemName: lesson.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 14, weight: .bold))
-                    .frame(width: 30, height: 28)
-                    .background(Capsule().fill(Theme.saffron))
-                    .foregroundStyle(.black)
+            if showsTransport {
+                Button { lesson.togglePlayback() } label: {
+                    Image(systemName: lesson.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .frame(width: 30, height: 28)
+                        .background(Capsule().fill(Theme.saffron))
+                        .foregroundStyle(.black)
+                }
+                .accessibilityLabel(lesson.isPlaying ? "Pause" : "Play")
+                .accessibilityIdentifier("playButton")
+                if lesson.practiceMode == .listen {
+                    Button { lesson.stopDemo() } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 12, weight: .bold))
+                            .frame(width: 28, height: 28)
+                            .background(Capsule().fill(Color.white.opacity(lesson.demoOrigin == nil ? 0.04 : 0.12)))
+                            .foregroundStyle(lesson.demoOrigin == nil ? .secondary : .primary)
+                    }
+                    .disabled(lesson.demoOrigin == nil)
+                    .accessibilityLabel("Stop")
+                    .accessibilityIdentifier("stopButton")
+                }
             }
-            .accessibilityLabel(lesson.isPlaying ? "Pause" : "Play")
             Button { model.setTempoScale(lesson.tempoScale - 0.1) } label: { Image(systemName: "minus") }
                 .accessibilityLabel("Slower")
             Text("\(Int((lesson.tempoScale * 100).rounded()))%")
@@ -64,6 +87,35 @@ private struct TempoControls: View {
         }
         .font(.system(size: 12, weight: .bold))
         .buttonStyle(.plain)
+    }
+}
+
+private struct MetronomeButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let isOn = model.metronomeEnabled
+        let bpm = model.metronomeBeatsPerMinute
+        Button { model.metronomeEnabled.toggle() } label: {
+            HStack(spacing: 3) {
+                Image(systemName: isOn ? "metronome.fill" : "metronome")
+                    .font(.system(size: 13, weight: .semibold))
+                    .symbolEffect(.bounce, value: model.metronome.beatCount)
+                if isOn, let bpm {
+                    Text("\(bpm)")
+                        .font(.system(size: 11, weight: .bold, design: .rounded).monospacedDigit())
+                }
+            }
+            .foregroundStyle(isOn ? .black : .primary)
+            .padding(.horizontal, isOn ? 7 : 0)
+            .frame(minWidth: 30, minHeight: 28)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(isOn ? Theme.saffron : Color.white.opacity(0.08)))
+            .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Metronome")
+        .accessibilityValue(isOn ? "On, \(bpm ?? 0) beats per minute" : "Off")
+        .accessibilityIdentifier("metronomeButton")
     }
 }
 
@@ -146,6 +198,8 @@ private struct FeedbackBanner: View {
     private func content(_ lesson: LessonEngine) -> some View {
         if lesson.score == nil {
             Text(model.isLoadingSong ? "Loading…" : "Pick a song to start")
+        } else if lesson.practiceMode == .listen {
+            listenContent(lesson)
         } else if lesson.isFinished {
             Image(systemName: "checkmark.seal.fill").foregroundStyle(Theme.correct)
             Text("Song complete")
@@ -180,6 +234,23 @@ private struct FeedbackBanner: View {
                 Image(systemName: "hand.point.down.fill").foregroundStyle(Theme.saffron)
                 nextPrompt(lesson)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func listenContent(_ lesson: LessonEngine) -> some View {
+        let speed = Int((lesson.tempoScale * 100).rounded())
+        if lesson.isPlaying {
+            Image(systemName: "ear.fill").foregroundStyle(Theme.saffron)
+            Text("Playing")
+            chips(lesson.soundingNotes)
+        } else if let origin = lesson.demoOrigin, lesson.steps.indices.contains(origin) {
+            Image(systemName: "pause.circle.fill").foregroundStyle(Theme.saffron)
+            Text("Paused — stop goes back to bar \(lesson.steps[origin].measure)")
+        } else {
+            Image(systemName: "play.circle.fill").foregroundStyle(Theme.saffron)
+            Text("Press play to hear it at \(speed)%")
+            Text("· keys light up with fingers").foregroundStyle(.secondary)
         }
     }
 

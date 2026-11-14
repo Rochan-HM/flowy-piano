@@ -50,6 +50,7 @@ final class AppModel {
         static let handMode = "handMode"
         static let practiceMode = "practiceMode"
         static let tempoScale = "tempoScale"
+        static let metronome = "metronome"
         static let autoZoom = "autoZoom"
         static let recognitionEnabled = "recognitionEnabled"
         static let recognitionURL = "recognitionURL"
@@ -76,7 +77,18 @@ final class AppModel {
     var showFingerNumbers: Bool { didSet { defaults.set(showFingerNumbers, forKey: Keys.showFingers) } }
     var soundEnabled: Bool { didSet { defaults.set(soundEnabled, forKey: Keys.sound) } }
     var micOctaveTolerant: Bool { didSet { defaults.set(micOctaveTolerant, forKey: Keys.micOctaveTolerant) } }
-    var playOtherHand: Bool { didSet { defaults.set(playOtherHand, forKey: Keys.playOtherHand) } }
+    var playOtherHand: Bool {
+        didSet {
+            defaults.set(playOtherHand, forKey: Keys.playOtherHand)
+            lesson.listenWithOtherHand = playOtherHand
+        }
+    }
+    var metronomeEnabled: Bool {
+        didSet {
+            defaults.set(metronomeEnabled, forKey: Keys.metronome)
+            updateMetronome()
+        }
+    }
     var visibleWhiteKeys: Int {
         didSet {
             defaults.set(visibleWhiteKeys, forKey: Keys.visibleWhiteKeys)
@@ -109,6 +121,7 @@ final class AppModel {
     let library = SongLibrary()
     let lesson = LessonEngine()
     let mic = MicController()
+    let metronome = Metronome()
     @ObservationIgnored let synth = PianoSynth()
 
     private(set) var currentSong: SongEntry?
@@ -156,6 +169,7 @@ final class AppModel {
         soundEnabled = defaults.object(forKey: Keys.sound) == nil ? true : defaults.bool(forKey: Keys.sound)
         micOctaveTolerant = defaults.object(forKey: Keys.micOctaveTolerant) == nil ? true : defaults.bool(forKey: Keys.micOctaveTolerant)
         playOtherHand = defaults.object(forKey: Keys.playOtherHand) == nil ? true : defaults.bool(forKey: Keys.playOtherHand)
+        metronomeEnabled = defaults.bool(forKey: Keys.metronome)
         let storedVisible = defaults.integer(forKey: Keys.visibleWhiteKeys)
         visibleWhiteKeys = storedVisible >= 7 ? min(storedVisible, 36) : 15
         lowestWhiteKey = KeyboardLayout.whiteIndex(of: 53)
@@ -167,6 +181,7 @@ final class AppModel {
 
         lesson.handMode = LessonEngine.HandMode(rawValue: defaults.string(forKey: Keys.handMode) ?? "") ?? .right
         lesson.practiceMode = LessonEngine.PracticeMode(rawValue: defaults.string(forKey: Keys.practiceMode) ?? "") ?? .wait
+        lesson.listenWithOtherHand = playOtherHand
         let storedScale = defaults.double(forKey: Keys.tempoScale)
         lesson.tempoScale = storedScale > 0 ? min(max(storedScale, 0.25), 1.5) : 0.7
     }
@@ -193,12 +208,28 @@ final class AppModel {
             self.stepAttackFloor = self.latestAttack
             self.pendingChordWrong = nil
             self.revealExpectedKeys()
+            self.updateMetronome()
         }
         lesson.onAccompaniment = { [weak self] note, duration in
             guard let self, self.playOtherHand, self.soundEnabled else { return }
             self.synth.play(note.midi, duration: duration, velocity: 0.55)
             self.mic.suppress(for: min(duration, 1) + 0.3)
         }
+        // The demo plays even with "Play sound" off: hearing the song is the point of Listen mode.
+        lesson.onDemoEvent = { [weak self] event, time in
+            guard let self else { return }
+            switch event.kind {
+            case .noteOn: self.synth.noteOn(event.midi, velocity: event.velocity, at: time)
+            case .noteOff: self.synth.noteOff(event.midi, at: time)
+            }
+        }
+        lesson.onDemoStop = { [weak self] in
+            self?.synth.cancelScheduled(.notes)
+            self?.synth.allNotesOff()
+        }
+        lesson.onPlaybackChanged = { [weak self] in self?.playbackChanged() }
+        metronome.onClick = { [weak self] click in self?.synth.click(accent: click.isDownbeat, at: click.time) }
+        metronome.onCancel = { [weak self] in self?.synth.cancelScheduled(.metronome) }
         mic.onNote = { [weak self] midi, attack in self?.handleMicNote(midi, attack: attack) }
         mic.onChroma = { [weak self] chroma, attack, age in self?.handleMicChroma(chroma, attack: attack, framesSinceAttack: age) }
 
@@ -216,7 +247,10 @@ final class AppModel {
             let score = try await library.loadScore(entry)
             currentSong = entry
             defaults.set(entry.id, forKey: Keys.song)
+            metronome.setMode(.off)
+            metronome.grid = BeatGrid(score: score)
             lesson.load(score)
+            updateMetronome()
             fitKeyboardToSong()
             errorMessage = nil
         } catch {
@@ -306,9 +340,52 @@ final class AppModel {
     }
 
     func setTempoScale(_ scale: Double) {
-        lesson.stopPlayback()
-        lesson.tempoScale = min(max(scale, 0.25), 1.5)
+        lesson.changeTempoScale(to: min(max(scale, 0.25), 1.5))
         defaults.set(lesson.tempoScale, forKey: Keys.tempoScale)
+        updateMetronome()
+    }
+
+    /// Restart button: back to the first step; a playing demo carries on from there.
+    func restartLesson() {
+        let replay = lesson.practiceMode == .listen && lesson.isPlaying
+        lesson.restart()
+        if replay { lesson.play() }
+    }
+
+    private func playbackChanged() {
+        let demoPlaying = lesson.practiceMode == .listen && lesson.isPlaying
+        if mic.isPaused != demoPlaying {
+            mic.isPaused = demoPlaying
+            // Let the demo's last notes die away before listening again.
+            if !demoPlaying { mic.suppress(for: 0.6) }
+        }
+        updateMetronome()
+    }
+
+    // MARK: Metronome
+
+    /// Quarter-note position of the current step, for the tempo there.
+    private var currentBeat: Double { lesson.currentStep?.notes.first?.onsetBeats ?? 0 }
+
+    /// Clicks per minute at the current step and speed.
+    var metronomeBeatsPerMinute: Int? {
+        guard let grid = lesson.score.map(BeatGrid.init(score:)) else { return nil }
+        return Int(grid.beatsPerMinute(atQuarter: currentBeat, tempoScale: lesson.tempoScale).rounded())
+    }
+
+    /// Clicks on the score's beats while the playhead runs (including the lead-in as a count-in),
+    /// otherwise a steady pulse at the song's tempo for wait mode.
+    private func updateMetronome() {
+        guard metronomeEnabled, let grid = metronome.grid, lesson.score != nil else {
+            metronome.setMode(.off)
+            return
+        }
+        if let songStart = lesson.songStartTime {
+            metronome.setMode(.synced(songStart: songStart, tempoScale: lesson.tempoScale))
+        } else {
+            metronome.setMode(.steady(interval: grid.interval(atQuarter: currentBeat, tempoScale: lesson.tempoScale),
+                                      beatsPerBar: grid.beatsPerBar))
+        }
     }
 
     // MARK: Input
@@ -432,7 +509,13 @@ final class AppModel {
 
     func keyState(for midi: Int) -> KeyVisualState {
         var state = KeyVisualState()
-        if let step = lesson.currentStep, let note = step.notes.first(where: { $0.midi == midi }) {
+        if lesson.practiceMode == .listen && lesson.isPlaying {
+            // Keys light while the demo sounds them; paused or stopped, the current step is shown.
+            if let note = lesson.soundingNotes.first(where: { $0.midi == midi }) {
+                state.expectedHand = note.hand
+                state.finger = showFingerNumbers ? note.finger : nil
+            }
+        } else if let step = lesson.currentStep, let note = step.notes.first(where: { $0.midi == midi }) {
             if lesson.satisfiedNoteIDs.contains(note.id) {
                 state.isSatisfied = true
             } else {
@@ -519,9 +602,13 @@ final class AppModel {
     /// Supported launch arguments, besides any settings key (e.g. `-notation carnatic -saPitchClass D`):
     /// `-importPath <file>`, `-recognizeFile <pdf or image>`, `-exportLessonSteps <json path>`,
     /// `-micFile <audio file>` (feeds the file through the microphone pipeline in real time),
-    /// `-demoSteps <n>`, `-demoWrongNote <midi>`, `-demoPressNote <midi>`, `-autoPlay YES` (tempo mode),
+    /// `-demoSteps <n>`, `-demoWrongNote <midi>`, `-demoPressNote <midi>`, `-startStep <n>` (skips ahead),
+    /// `-autoPlay YES` (tempo and listen mode), `-recordOutput <file>` (writes the synth's output),
     /// `-openLibrary YES`, `-openSettings YES`, `-startMic YES`.
     private func applyLaunchOptions() async {
+        if let path = defaults.string(forKey: "recordOutput") {
+            synth.record(to: URL(fileURLWithPath: path))
+        }
         if let path = defaults.string(forKey: "importPath") {
             await importFile(URL(fileURLWithPath: path))
         }
@@ -556,6 +643,7 @@ final class AppModel {
             pressedKeys.insert(pressed)
             process(pressed, source: .touch)
         }
+        for _ in 0..<max(0, defaults.integer(forKey: "startStep")) { lesson.skipStep() }
         if defaults.bool(forKey: "autoPlay") { lesson.play() }
         if defaults.bool(forKey: "openLibrary") { isLibraryPresented = true }
         if defaults.bool(forKey: "openSettings") { isSettingsPresented = true }

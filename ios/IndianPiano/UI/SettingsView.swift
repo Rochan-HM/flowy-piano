@@ -31,12 +31,17 @@ struct SettingsView: View {
                     Text(notationFooter)
                 }
 
-                Section("Lesson") {
+                Section {
                     Toggle("Show finger numbers", isOn: $model.showFingerNumbers)
-                    Toggle("App plays the other hand in tempo mode", isOn: $model.playOtherHand)
+                    Toggle("App plays the other hand", isOn: $model.playOtherHand)
+                    Toggle("Metronome", isOn: $model.metronomeEnabled)
                     Stepper(value: Binding(get: { model.lesson.tempoScale }, set: { model.setTempoScale($0) }), in: 0.25...1.5, step: 0.05) {
-                        LabeledContent("Tempo mode speed", value: "\(Int((model.lesson.tempoScale * 100).rounded()))%")
+                        LabeledContent("Speed", value: "\(Int((model.lesson.tempoScale * 100).rounded()))%")
                     }
+                } header: {
+                    Text("Lesson")
+                } footer: {
+                    Text("In Tempo and Listen mode the app plays the hand you aren't practising, softer. The speed applies to Tempo, Listen and the metronome, which accents the first beat of each bar.")
                 }
 
                 Section {
