@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import os
+import QuartzCore
 
 enum AudioSessionConfigurator {
     /// Playback-only until the microphone is needed: a record-capable session makes every audio
@@ -22,6 +23,9 @@ enum AudioSessionConfigurator {
 }
 
 /// Polyphonic additive piano-like synth rendered by an `AVAudioSourceNode`.
+///
+/// The `at:` times are `CACurrentMediaTime()` seconds. The render thread starts each scheduled
+/// event on its exact sample, so events sent a little ahead of time play without timer jitter.
 final class PianoSynth: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let core = SynthCore(maxVoices: 32)
@@ -30,6 +34,7 @@ final class PianoSynth: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.rochan.indianpiano.synth", qos: .userInitiated)
     private var sourceNode: AVAudioSourceNode?
     private var configObserver: NSObjectProtocol?
+    private var recordingFile: AVAudioFile?
 
     var isRunning: Bool { engine.isRunning }
 
@@ -46,11 +51,11 @@ final class PianoSynth: @unchecked Sendable {
             core.setSampleRate(Float(sampleRate))
             guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else { return }
             let core = self.core
-            let node = AVAudioSourceNode(format: format) { _, _, frameCount, bufferList in
+            let node = AVAudioSourceNode(format: format) { _, timestamp, frameCount, bufferList in
                 let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
                 guard let first = buffers.first?.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
                 let frames = Int(frameCount)
-                core.render(into: first, frames: frames)
+                core.render(into: first, frames: frames, time: core.clockTime(of: timestamp.pointee))
                 if buffers.count > 1 {
                     for index in 1..<buffers.count {
                         buffers[index].mData?.copyMemory(from: first, byteCount: frames * MemoryLayout<Float>.size)
@@ -76,12 +81,12 @@ final class PianoSynth: @unchecked Sendable {
         }
     }
 
-    func noteOn(_ midi: Int, velocity: Float = 0.8) {
+    func noteOn(_ midi: Int, velocity: Float = 0.8, at time: TimeInterval = 0) {
         if !isRunning { start() }
-        core.enqueue(.noteOn, midi: midi, velocity: velocity)
+        core.enqueue(.noteOn, midi: midi, velocity: velocity, at: time)
     }
 
-    func noteOff(_ midi: Int) { core.enqueue(.noteOff, midi: midi, velocity: 0) }
+    func noteOff(_ midi: Int, at time: TimeInterval = 0) { core.enqueue(.noteOff, midi: midi, velocity: 0, at: time) }
 
     func allNotesOff() { core.enqueue(.allOff, midi: 0, velocity: 0) }
 
@@ -90,18 +95,109 @@ final class PianoSynth: @unchecked Sendable {
         noteOn(midi, velocity: velocity)
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0.08, duration)) { [weak self] in self?.noteOff(midi) }
     }
+
+    /// A metronome click; accented clicks (the first beat of a bar) are brighter and louder.
+    func click(accent: Bool, at time: TimeInterval) {
+        if !isRunning { start() }
+        core.enqueue(.click, midi: accent ? 1 : 0, velocity: 1, at: time, group: .metronome)
+    }
+
+    /// Drops the group's scheduled events that haven't started yet.
+    func cancelScheduled(_ group: SynthCore.Group) {
+        core.enqueue(.cancel, midi: 0, velocity: 0, group: group)
+    }
+
+    /// Writes everything the synth plays to a file, to put sound on screen recordings.
+    func record(to url: URL) {
+        queue.async {
+            self.startOnQueue()
+            let mixer = self.engine.mainMixerNode
+            let format = mixer.outputFormat(forBus: 0)
+            let log = Logger(subsystem: "com.rochan.indianpiano", category: "audio")
+            do {
+                let file = try AVAudioFile(forWriting: url, settings: format.settings)
+                self.recordingFile = file
+                var announced = false
+                mixer.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, time in
+                    if !announced, time.isHostTimeValid {
+                        announced = true
+                        let start = Date().timeIntervalSince1970 - (CACurrentMediaTime() - AVAudioTime.seconds(forHostTime: time.hostTime))
+                        log.info("Recording synth output to \(url.path, privacy: .public), first sample at \(String(format: "%.3f", start), privacy: .public)")
+                    }
+                    try? file.write(from: buffer)
+                }
+            } catch {
+                log.error("Couldn't record synth output: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
 }
 
 /// Real-time voice state. All storage is preallocated; the render thread never allocates or blocks.
 final class SynthCore: @unchecked Sendable {
-    enum Command: UInt8 { case noteOn, noteOff, allOff }
+    enum Command: UInt8 { case noteOn, noteOff, allOff, click, cancel }
+    /// Scheduled events are tagged so the demo and the metronome can each cancel only their own.
+    enum Group: UInt8 { case notes, metronome }
+
+    private struct Event {
+        var command: Command
+        var note: Int32
+        var velocity: Float
+        /// Clock time to start at; 0 means as soon as possible.
+        var time: Double
+        var group: Group
+    }
+
+    private struct Biquad {
+        var b0: Float = 0, b1: Float = 0, b2: Float = 0, a1: Float = 0, a2: Float = 0
+        var x1: Float = 0, x2: Float = 0, y1: Float = 0, y2: Float = 0
+
+        init() {}
+
+        init(bandPass center: Float, q: Float, sampleRate: Float) {
+            let w0 = 2 * Float.pi * center / sampleRate
+            let alpha = sinf(w0) / (2 * q)
+            let a0 = 1 + alpha
+            b0 = alpha / a0
+            b2 = -alpha / a0
+            a1 = -2 * cosf(w0) / a0
+            a2 = (1 - alpha) / a0
+        }
+
+        init(highPass cutoff: Float, q: Float, sampleRate: Float) {
+            let w0 = 2 * Float.pi * cutoff / sampleRate
+            let alpha = sinf(w0) / (2 * q)
+            let a0 = 1 + alpha
+            let c = cosf(w0)
+            b0 = (1 + c) / 2 / a0
+            b1 = -(1 + c) / a0
+            b2 = b0
+            a1 = -2 * c / a0
+            a2 = (1 - alpha) / a0
+        }
+
+        mutating func process(_ x: Float) -> Float {
+            let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2 = x1; x1 = x; y2 = y1; y1 = y
+            return y
+        }
+    }
 
     static let partialCount = 8
+    static let clickVoiceCount = 4
     /// Relative amplitudes of harmonics 1...7; the eighth partial is a slightly detuned unison.
     private static let partialShape: [Float] = [1.0, 0.55, 0.32, 0.22, 0.14, 0.09, 0.05]
+    /// Clicks are noise band-passed well above the notes' fundamentals, then high-passed: no
+    /// stable pitch for the microphone's YIN detector, and almost nothing in the band below
+    /// 1.5 kHz that `MicAnalyzer` judges key strikes on.
+    static let clickCenter: (normal: Float, accent: Float) = (4_200, 5_600)
+    static let clickHighPass: Float = 2_600
+    static let clickGain: (normal: Float, accent: Float) = (0.32, 0.5)
+    private static let clickSections = 4
     private let maxVoices: Int
     private var sampleRate: Float = 44_100
     private var voiceGain: Float = 0.16
+    private let hostTicksToSeconds: Double
 
     private let active: UnsafeMutablePointer<Bool>
     private let released: UnsafeMutablePointer<Bool>
@@ -116,12 +212,22 @@ final class SynthCore: @unchecked Sendable {
     private let amplitude: UnsafeMutablePointer<Float>
     private let decay: UnsafeMutablePointer<Float>
 
+    private let clickActive: UnsafeMutablePointer<Bool>
+    private let clickAge: UnsafeMutablePointer<Int32>
+    private let clickLevel: UnsafeMutablePointer<Float>
+    private let clickDecay: UnsafeMutablePointer<Float>
+    /// `clickSections` filter sections per voice: two band-passes, then a fourth-order high-pass.
+    private let clickFilter: UnsafeMutablePointer<Biquad>
+    private var noiseSeed: UInt32 = 0x2545_F491
+
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private let queueCapacity = 256
-    private let queuedKind: UnsafeMutablePointer<UInt8>
-    private let queuedNote: UnsafeMutablePointer<Int32>
-    private let queuedVelocity: UnsafeMutablePointer<Float>
+    private let queued: UnsafeMutablePointer<Event>
     private var queuedCount = 0
+    /// Scheduled events waiting for their time, sorted by time (render thread only).
+    private let pendingCapacity = 512
+    private let pending: UnsafeMutablePointer<Event>
+    private var pendingCount = 0
 
     init(maxVoices: Int) {
         self.maxVoices = maxVoices
@@ -143,10 +249,18 @@ final class SynthCore: @unchecked Sendable {
         increment = alloc(partials, 0)
         amplitude = alloc(partials, 0)
         decay = alloc(partials, 1)
-        queuedKind = alloc(queueCapacity, 0)
-        queuedNote = alloc(queueCapacity, 0)
-        queuedVelocity = alloc(queueCapacity, 0)
+        clickActive = alloc(Self.clickVoiceCount, false)
+        clickAge = alloc(Self.clickVoiceCount, 0)
+        clickLevel = alloc(Self.clickVoiceCount, 0)
+        clickDecay = alloc(Self.clickVoiceCount, 0)
+        clickFilter = alloc(Self.clickVoiceCount * Self.clickSections, Biquad())
+        let empty = Event(command: .noteOn, note: 0, velocity: 0, time: 0, group: .notes)
+        queued = alloc(queueCapacity, empty)
+        pending = alloc(pendingCapacity, empty)
         lock = alloc(1, os_unfair_lock())
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+        hostTicksToSeconds = Double(timebase.numer) / Double(timebase.denom) / 1_000_000_000
     }
 
     deinit {
@@ -162,9 +276,13 @@ final class SynthCore: @unchecked Sendable {
         increment.deallocate()
         amplitude.deallocate()
         decay.deallocate()
-        queuedKind.deallocate()
-        queuedNote.deallocate()
-        queuedVelocity.deallocate()
+        clickActive.deallocate()
+        clickAge.deallocate()
+        clickLevel.deallocate()
+        clickDecay.deallocate()
+        clickFilter.deallocate()
+        queued.deallocate()
+        pending.deallocate()
         lock.deallocate()
     }
 
@@ -174,25 +292,30 @@ final class SynthCore: @unchecked Sendable {
         os_unfair_lock_unlock(lock)
     }
 
-    func enqueue(_ command: Command, midi: Int, velocity: Float) {
+    /// `CACurrentMediaTime()` seconds of a render call's first frame.
+    func clockTime(of timestamp: AudioTimeStamp) -> Double {
+        let ticks = timestamp.mFlags.contains(.hostTimeValid) ? timestamp.mHostTime : mach_absolute_time()
+        return Double(ticks) * hostTicksToSeconds
+    }
+
+    func enqueue(_ command: Command, midi: Int, velocity: Float, at time: Double = 0, group: Group = .notes) {
         os_unfair_lock_lock(lock)
         if queuedCount < queueCapacity {
-            queuedKind[queuedCount] = command.rawValue
-            queuedNote[queuedCount] = Int32(midi)
-            queuedVelocity[queuedCount] = velocity
+            queued[queuedCount] = Event(command: command, note: Int32(midi), velocity: velocity, time: time, group: group)
             queuedCount += 1
         }
         os_unfair_lock_unlock(lock)
     }
 
-    func render(into output: UnsafeMutablePointer<Float>, frames: Int) {
+    /// `time` is the clock time of the first frame; without it scheduled events start immediately.
+    func render(into output: UnsafeMutablePointer<Float>, frames: Int, time: Double? = nil) {
         if os_unfair_lock_trylock(lock) {
             for index in 0..<queuedCount {
-                switch Command(rawValue: queuedKind[index]) {
-                case .noteOn?: startVoice(Int(queuedNote[index]), velocity: queuedVelocity[index])
-                case .noteOff?: releaseVoices(Int(queuedNote[index]))
-                case .allOff?: for voice in 0..<maxVoices where active[voice] { released[voice] = true }
-                case nil: break
+                let event = queued[index]
+                if event.time > 0, time != nil, event.command != .cancel {
+                    schedule(event)
+                } else {
+                    apply(event)
                 }
             }
             queuedCount = 0
@@ -200,6 +323,64 @@ final class SynthCore: @unchecked Sendable {
         }
 
         output.initialize(repeating: 0, count: frames)
+        let rate = Double(sampleRate)
+        var cursor = 0
+        while cursor < frames {
+            var end = frames
+            while pendingCount > 0 {
+                let due = time.map { Int(((pending[0].time - $0) * rate).rounded(.down)) } ?? cursor
+                if due > cursor {
+                    end = min(frames, due)
+                    break
+                }
+                apply(pending[0])
+                removeFirstPending()
+            }
+            renderVoices(into: output + cursor, frames: end - cursor)
+            renderClicks(into: output + cursor, frames: end - cursor)
+            cursor = end
+        }
+
+        for frame in 0..<frames { output[frame] = tanhf(output[frame]) }
+    }
+
+    private func apply(_ event: Event) {
+        switch event.command {
+        case .noteOn: startVoice(Int(event.note), velocity: event.velocity)
+        case .noteOff: releaseVoices(Int(event.note))
+        case .allOff: for voice in 0..<maxVoices where active[voice] { released[voice] = true }
+        case .click: startClick(accent: event.note != 0, level: event.velocity)
+        case .cancel: cancelPending(event.group)
+        }
+    }
+
+    /// Inserts after events with the same time, so e.g. a note-off still precedes the next note-on.
+    private func schedule(_ event: Event) {
+        guard pendingCount < pendingCapacity else { return }
+        var index = pendingCount
+        while index > 0 && pending[index - 1].time > event.time {
+            pending[index] = pending[index - 1]
+            index -= 1
+        }
+        pending[index] = event
+        pendingCount += 1
+    }
+
+    private func removeFirstPending() {
+        pendingCount -= 1
+        for index in 0..<pendingCount { pending[index] = pending[index + 1] }
+    }
+
+    private func cancelPending(_ group: Group) {
+        var kept = 0
+        for index in 0..<pendingCount where pending[index].group != group {
+            pending[kept] = pending[index]
+            kept += 1
+        }
+        pendingCount = kept
+    }
+
+    private func renderVoices(into output: UnsafeMutablePointer<Float>, frames: Int) {
         let attackSamples = sampleRate * 0.004
         let twoPi = Float.pi * 2
 
@@ -240,8 +421,6 @@ final class SynthCore: @unchecked Sendable {
                 active[voice] = false
             }
         }
-
-        for frame in 0..<frames { output[frame] = tanhf(output[frame]) }
     }
 
     private func startVoice(_ midi: Int, velocity: Float) {
@@ -296,5 +475,49 @@ final class SynthCore: @unchecked Sendable {
 
     private func releaseVoices(_ midi: Int) {
         for voice in 0..<maxVoices where active[voice] && note[voice] == Int32(midi) { released[voice] = true }
+    }
+
+    // MARK: Metronome clicks
+
+    private func startClick(accent: Bool, level: Float) {
+        var slot = 0
+        var oldest: Int32 = -1
+        for voice in 0..<Self.clickVoiceCount {
+            if !clickActive[voice] { slot = voice; break }
+            if clickAge[voice] > oldest { oldest = clickAge[voice]; slot = voice }
+        }
+        let center = min(accent ? Self.clickCenter.accent : Self.clickCenter.normal, sampleRate * 0.4)
+        let filter = clickFilter + slot * Self.clickSections
+        filter[0] = Biquad(bandPass: center, q: 1.4, sampleRate: sampleRate)
+        filter[1] = filter[0]
+        filter[2] = Biquad(highPass: Self.clickHighPass, q: 0.541_196, sampleRate: sampleRate)
+        filter[3] = Biquad(highPass: Self.clickHighPass, q: 1.306_563, sampleRate: sampleRate)
+        clickLevel[slot] = level * (accent ? Self.clickGain.accent : Self.clickGain.normal)
+        clickDecay[slot] = expf(-1 / ((accent ? 0.009 : 0.007) * sampleRate))
+        clickAge[slot] = 0
+        clickActive[slot] = true
+    }
+
+    private func renderClicks(into output: UnsafeMutablePointer<Float>, frames: Int) {
+        let attackSamples = max(1, sampleRate * 0.0005)
+        for voice in 0..<Self.clickVoiceCount where clickActive[voice] {
+            let filter = clickFilter + voice * Self.clickSections
+            var gain = clickLevel[voice]
+            let factor = clickDecay[voice]
+            var sampleAge = clickAge[voice]
+            for frame in 0..<frames {
+                noiseSeed = noiseSeed &* 1_664_525 &+ 1_013_904_223
+                let noise = Float(Int32(bitPattern: noiseSeed)) / Float(Int32.max)
+                let ramp = Float(sampleAge) < attackSamples ? Float(sampleAge) / attackSamples : 1
+                var sample = noise * gain * ramp
+                for section in 0..<Self.clickSections { sample = filter[section].process(sample) }
+                output[frame] += sample
+                gain *= factor
+                sampleAge &+= 1
+            }
+            clickLevel[voice] = gain
+            clickAge[voice] = sampleAge
+            if sampleAge > Int32(sampleRate * 0.08) { clickActive[voice] = false }
+        }
     }
 }
