@@ -12,7 +12,7 @@ Audio input:
   --input blackhole  play the WAV into BlackHole 2ch while the app listens on the real mic input
                      (needs BlackHole as the default input and Simulator allowed to use the mic)
 
-Usage: python3 tools/e2e/run_e2e.py [--input file|blackhole] [--case NAME ...] [--video NAME]
+Usage: python3 tools/e2e/run_e2e.py [--input file|blackhole] [--case NAME ...] [--video NAME] [--device UDID]
 Results: /tmp/indianpiano-e2e/results.json and a Markdown table on stdout.
 """
 
@@ -64,6 +64,20 @@ def simctl(*args, check=True):
     return sh("xcrun", "simctl", *args, check=check)
 
 
+DEVICE = "booted"
+
+
+def pick_device(requested=None):
+    """The Simulator to drive: `simctl ... booted` picks an arbitrary one when several are booted."""
+    if requested:
+        return requested
+    booted = json.loads(sh("xcrun", "simctl", "list", "devices", "booted", "-j").stdout)["devices"]
+    udids = [device["udid"] for devices in booted.values() for device in devices if device.get("state") == "Booted"]
+    if len(udids) == 1:
+        return udids[0]
+    raise SystemExit(f"{len(udids)} simulators are booted; pass --device <udid>" if udids else "no simulator is booted")
+
+
 def app_args(case, recognition):
     args = ["-handMode", case["hand"], "-practiceMode", "wait", "-notation", case["notation"],
             "-saPitchClass", case["sa"], "-showFingers", "YES", "-sound", "NO", "-micOctaveTolerant", "YES"]
@@ -73,8 +87,8 @@ def app_args(case, recognition):
 
 
 def launch(args):
-    simctl("terminate", "booted", BUNDLE, check=False)
-    out = simctl("launch", "booted", BUNDLE, *args).stdout
+    simctl("terminate", DEVICE, BUNDLE, check=False)
+    out = simctl("launch", DEVICE, BUNDLE, *args).stdout
     return int(out.strip().split(":")[-1])
 
 
@@ -234,7 +248,7 @@ def run_case(case, args, recognition):
         video_path = os.path.join(WORK, f"{case['name']}.mp4")
         if os.path.exists(video_path):
             os.remove(video_path)
-        video = subprocess.Popen(["xcrun", "simctl", "io", "booted", "recordVideo", "--codec=h264", "--force", video_path],
+        video = subprocess.Popen(["xcrun", "simctl", "io", DEVICE, "recordVideo", "--codec=h264", "--force", video_path],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1.5)
     if args.input == "file":
@@ -251,7 +265,7 @@ def run_case(case, args, recognition):
         time.sleep(1)
         video.send_signal(2)
         video.wait(timeout=20)
-    simctl("io", "booted", "screenshot", os.path.join(folder, "end.png"), check=False)
+    simctl("io", DEVICE, "screenshot", os.path.join(folder, "end.png"), check=False)
     events = parse_events(pid)
     result = check(expected, events, steps)
     detections = sum(1 for line in log_lines(pid) if "Detected note" in line)
@@ -268,13 +282,16 @@ def main():
     parser.add_argument("--input", choices=["file", "blackhole"], default="file")
     parser.add_argument("--case", action="append", help="run only these cases")
     parser.add_argument("--video", help="record the Simulator screen during this case")
+    parser.add_argument("--device", help="Simulator UDID (needed when several simulators are booted)")
     parser.add_argument("--omr-url", default="http://localhost:8000")
     parser.add_argument("--omr-token", default=os.environ.get("OMR_API_TOKEN", "dev-token"))
     args = parser.parse_args()
+    global DEVICE
+    DEVICE = pick_device(args.device)
 
     os.makedirs(WORK, exist_ok=True)
     open(LOG, "w").close()
-    logger = subprocess.Popen(["xcrun", "simctl", "spawn", "booted", "log", "stream", "--level", "info", "--style", "compact",
+    logger = subprocess.Popen(["xcrun", "simctl", "spawn", DEVICE, "log", "stream", "--level", "info", "--style", "compact",
                                "--predicate", f'subsystem == "{BUNDLE}"'], stdout=open(LOG, "a"), stderr=subprocess.DEVNULL)
     time.sleep(1.5)
     recognition = dict(url=args.omr_url, token=args.omr_token)
@@ -300,7 +317,7 @@ def main():
             print(json.dumps(result), flush=True)
     finally:
         logger.terminate()
-        simctl("terminate", "booted", BUNDLE, check=False)
+        simctl("terminate", DEVICE, BUNDLE, check=False)
         if original_devices:
             set_audio_device("input", original_devices["input"])
             if audio_device("output") != original_devices["output"]:
