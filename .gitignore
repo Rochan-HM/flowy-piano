@@ -1,5 +1,38 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcresult
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+timeline.xctimeline
+.build/
+.swiftpm/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
 .venv/
+venv/
+.env
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Recognition server: cached detections written next to the test corpus
 server/testdata/**/*.dets_*.json
