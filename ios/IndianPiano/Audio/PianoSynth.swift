@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 import os
@@ -134,10 +135,22 @@ final class PianoSynth: @unchecked Sendable {
 }
 
 /// Real-time voice state. All storage is preallocated; the render thread never allocates or blocks.
+///
+/// Each voice is rendered a block at a time with Accelerate (vectorized sines and gain ramps), so a
+/// full chord stays far inside the audio deadline even in an unoptimized build. The mix goes through
+/// a look-ahead peak limiter: many notes at once are turned down smoothly instead of being clipped.
 final class SynthCore: @unchecked Sendable {
     enum Command: UInt8 { case noteOn, noteOff, allOff, click, cancel }
     /// Scheduled events are tagged so the demo and the metronome can each cancel only their own.
     enum Group: UInt8 { case notes, metronome }
+
+    /// What the render thread has done so far, for tests and diagnostics.
+    struct Statistics: Equatable {
+        var mostVoicesSounding = 0
+        var voicesStolen = 0
+        /// Lowest gain the output limiter applied; 1 means it never engaged.
+        var lowestLimiterGain: Float = 1
+    }
 
     private struct Event {
         var command: Command
@@ -194,23 +207,63 @@ final class SynthCore: @unchecked Sendable {
     static let clickHighPass: Float = 2_600
     static let clickGain: (normal: Float, accent: Float) = (0.32, 0.5)
     private static let clickSections = 4
+    /// Longer render calls are split: keeps the scratch buffers small and the sine phase ramps precise.
+    private static let chunkFrames = 512
+    /// A stolen, restruck or expired voice fades out over this long rather than stopping mid-wave.
+    static let fadeSeconds: Float = 0.005
+    /// Output peaks stay at or below this, about -1 dBFS.
+    static let limiterCeiling: Float = 0.89
+    /// How far ahead the limiter sees, so it has turned down before a loud onset reaches the output.
+    /// Scheduled events start this much earlier to make up for the delay.
+    static let limiterLookahead: Float = 0.002
+    /// Longer than half a period of the lowest piano note, so the gain doesn't ripple with the waveform.
+    private static let limiterHold: Float = 0.025
+    private static let limiterRelease: Float = 0.15
+    private static let maxLookaheadFrames = 1_024
+
+    /// Voices that may sound at once; the slots beyond these hold voices fading out.
     private let maxVoices: Int
+    private let slotCount: Int
     private var sampleRate: Float = 44_100
     private var voiceGain: Float = 0.16
     private let hostTicksToSeconds: Double
 
+    private var attackFrames: Int32 = 1
+    private var fadeFrames: Int32 = 1
+    private var maxAgeFrames: Int32 = 1
+    private var lookaheadFrames = 1
+    private var holdFrames: Int32 = 1
+    private var releaseCoefficient: Float = 0
+    private var attackCoefficient: Float = 1
+
     private let active: UnsafeMutablePointer<Bool>
     private let released: UnsafeMutablePointer<Bool>
+    private let fading: UnsafeMutablePointer<Bool>
     private let note: UnsafeMutablePointer<Int32>
     private let age: UnsafeMutablePointer<Int32>
+    private let fadeLeft: UnsafeMutablePointer<Int32>
     private let level: UnsafeMutablePointer<Float>
-    private let releaseFactor: UnsafeMutablePointer<Float>
+    /// Per-frame natural-log decay rates: `value *= exp(rate * frames)`.
+    private let releaseRate: UnsafeMutablePointer<Float>
     private let transient: UnsafeMutablePointer<Float>
-    private let transientFactor: UnsafeMutablePointer<Float>
+    private let transientRate: UnsafeMutablePointer<Float>
     private let phase: UnsafeMutablePointer<Float>
     private let increment: UnsafeMutablePointer<Float>
     private let amplitude: UnsafeMutablePointer<Float>
-    private let decay: UnsafeMutablePointer<Float>
+    private let decayRate: UnsafeMutablePointer<Float>
+
+    private let phaseScratch: UnsafeMutablePointer<Float>
+    private let sineScratch: UnsafeMutablePointer<Float>
+    private let voiceScratch: UnsafeMutablePointer<Float>
+    private let rampStart: UnsafeMutablePointer<Float>
+    private let rampStep: UnsafeMutablePointer<Float>
+
+    private let delayLine: UnsafeMutablePointer<Float>
+    private var delayIndex = 0
+    private var limiterTarget: Float = 1
+    private var limiterGain: Float = 1
+    private var holdLeft: Int32 = 0
+    private(set) var statistics = Statistics()
 
     private let clickActive: UnsafeMutablePointer<Bool>
     private let clickAge: UnsafeMutablePointer<Int32>
@@ -231,24 +284,33 @@ final class SynthCore: @unchecked Sendable {
 
     init(maxVoices: Int) {
         self.maxVoices = maxVoices
+        slotCount = maxVoices + max(4, maxVoices / 2)
         func alloc<T>(_ count: Int, _ value: T) -> UnsafeMutablePointer<T> {
             let pointer = UnsafeMutablePointer<T>.allocate(capacity: count)
             pointer.initialize(repeating: value, count: count)
             return pointer
         }
-        let partials = maxVoices * Self.partialCount
-        active = alloc(maxVoices, false)
-        released = alloc(maxVoices, false)
-        note = alloc(maxVoices, 0)
-        age = alloc(maxVoices, 0)
-        level = alloc(maxVoices, 0)
-        releaseFactor = alloc(maxVoices, 1)
-        transient = alloc(maxVoices, 0)
-        transientFactor = alloc(maxVoices, 0)
+        let partials = slotCount * Self.partialCount
+        active = alloc(slotCount, false)
+        released = alloc(slotCount, false)
+        fading = alloc(slotCount, false)
+        note = alloc(slotCount, 0)
+        age = alloc(slotCount, 0)
+        fadeLeft = alloc(slotCount, 0)
+        level = alloc(slotCount, 0)
+        releaseRate = alloc(slotCount, 0)
+        transient = alloc(slotCount, 0)
+        transientRate = alloc(slotCount, 0)
         phase = alloc(partials, 0)
         increment = alloc(partials, 0)
         amplitude = alloc(partials, 0)
-        decay = alloc(partials, 1)
+        decayRate = alloc(partials, 0)
+        phaseScratch = alloc(Self.partialCount * Self.chunkFrames, 0)
+        sineScratch = alloc(Self.partialCount * Self.chunkFrames, 0)
+        voiceScratch = alloc(Self.chunkFrames, 0)
+        rampStart = alloc(Self.partialCount, 0)
+        rampStep = alloc(Self.partialCount, 0)
+        delayLine = alloc(Self.maxLookaheadFrames, 0)
         clickActive = alloc(Self.clickVoiceCount, false)
         clickAge = alloc(Self.clickVoiceCount, 0)
         clickLevel = alloc(Self.clickVoiceCount, 0)
@@ -261,25 +323,16 @@ final class SynthCore: @unchecked Sendable {
         var timebase = mach_timebase_info_data_t()
         mach_timebase_info(&timebase)
         hostTicksToSeconds = Double(timebase.numer) / Double(timebase.denom) / 1_000_000_000
+        updateRateDependentValues()
     }
 
     deinit {
-        active.deallocate()
-        released.deallocate()
-        note.deallocate()
-        age.deallocate()
-        level.deallocate()
-        releaseFactor.deallocate()
-        transient.deallocate()
-        transientFactor.deallocate()
-        phase.deallocate()
-        increment.deallocate()
-        amplitude.deallocate()
-        decay.deallocate()
-        clickActive.deallocate()
-        clickAge.deallocate()
-        clickLevel.deallocate()
-        clickDecay.deallocate()
+        for pointer in [active, released, fading, clickActive] { pointer.deallocate() }
+        for pointer in [note, age, fadeLeft, clickAge] { pointer.deallocate() }
+        for pointer in [level, releaseRate, transient, transientRate, phase, increment, amplitude, decayRate,
+                        phaseScratch, sineScratch, voiceScratch, rampStart, rampStep, delayLine, clickLevel, clickDecay] {
+            pointer.deallocate()
+        }
         clickFilter.deallocate()
         queued.deallocate()
         pending.deallocate()
@@ -289,7 +342,21 @@ final class SynthCore: @unchecked Sendable {
     func setSampleRate(_ rate: Float) {
         os_unfair_lock_lock(lock)
         sampleRate = rate
+        updateRateDependentValues()
         os_unfair_lock_unlock(lock)
+    }
+
+    private func updateRateDependentValues() {
+        attackFrames = max(1, Int32((sampleRate * 0.004).rounded()))
+        fadeFrames = max(1, Int32((sampleRate * Self.fadeSeconds).rounded()))
+        maxAgeFrames = Int32(sampleRate * 12)
+        lookaheadFrames = min(Self.maxLookaheadFrames, max(1, Int((sampleRate * Self.limiterLookahead).rounded())))
+        holdFrames = Int32(sampleRate * Self.limiterHold)
+        releaseCoefficient = expf(-1 / (Self.limiterRelease * sampleRate))
+        // Within the look-ahead the gain gets 98% of the way to what the coming peak needs.
+        attackCoefficient = 1 - expf(-4 / Float(lookaheadFrames))
+        delayLine.update(repeating: 0, count: Self.maxLookaheadFrames)
+        delayIndex = 0
     }
 
     /// `CACurrentMediaTime()` seconds of a render call's first frame.
@@ -324,13 +391,14 @@ final class SynthCore: @unchecked Sendable {
 
         output.initialize(repeating: 0, count: frames)
         let rate = Double(sampleRate)
+        let lead = lookaheadFrames
         var cursor = 0
         while cursor < frames {
-            var end = frames
+            var end = min(frames, cursor + Self.chunkFrames)
             while pendingCount > 0 {
-                let due = time.map { Int(((pending[0].time - $0) * rate).rounded(.down)) } ?? cursor
+                let due = time.map { Int(((pending[0].time - $0) * rate).rounded(.down)) - lead } ?? cursor
                 if due > cursor {
-                    end = min(frames, due)
+                    end = min(end, due)
                     break
                 }
                 apply(pending[0])
@@ -340,15 +408,14 @@ final class SynthCore: @unchecked Sendable {
             renderClicks(into: output + cursor, frames: end - cursor)
             cursor = end
         }
-
-        for frame in 0..<frames { output[frame] = tanhf(output[frame]) }
+        limit(output, frames: frames)
     }
 
     private func apply(_ event: Event) {
         switch event.command {
         case .noteOn: startVoice(Int(event.note), velocity: event.velocity)
         case .noteOff: releaseVoices(Int(event.note))
-        case .allOff: for voice in 0..<maxVoices where active[voice] { released[voice] = true }
+        case .allOff: for voice in 0..<slotCount where active[voice] && !fading[voice] { released[voice] = true }
         case .click: startClick(accent: event.note != 0, level: event.velocity)
         case .cancel: cancelPending(event.group)
         }
@@ -380,56 +447,127 @@ final class SynthCore: @unchecked Sendable {
         pendingCount = kept
     }
 
+    // MARK: Voices
+
     private func renderVoices(into output: UnsafeMutablePointer<Float>, frames: Int) {
-        let attackSamples = sampleRate * 0.004
+        guard frames > 0 else { return }
+        let length = vDSP_Length(frames)
         let twoPi = Float.pi * 2
-
-        for voice in 0..<maxVoices where active[voice] {
+        for voice in 0..<slotCount where active[voice] {
             let base = voice * Self.partialCount
-            var envelope = level[voice]
-            var hammer = transient[voice]
-            let hammerFactor = transientFactor[voice]
-            let isReleased = released[voice]
-            let release = releaseFactor[voice]
-            var sampleAge = age[voice]
-
-            for frame in 0..<frames {
-                var sample: Float = 0
-                for partial in 0..<Self.partialCount {
-                    let index = base + partial
-                    let amp = amplitude[index]
-                    if amp > 1e-5 {
-                        sample += amp * sinf(phase[index])
-                        var next = phase[index] + increment[index]
-                        if next >= twoPi { next -= twoPi }
-                        phase[index] = next
-                        amplitude[index] = amp * decay[index]
-                    }
-                }
-                let attack = Float(sampleAge) < attackSamples ? Float(sampleAge) / attackSamples : 1
-                output[frame] += sample * envelope * attack * (1 + hammer) * voiceGain
-                hammer *= hammerFactor
-                if isReleased { envelope *= release }
-                sampleAge &+= 1
+            var rows = 0
+            for partial in 0..<Self.partialCount {
+                let index = base + partial
+                let start = amplitude[index]
+                guard start > 1e-5 else { continue }
+                let end = start * expf(decayRate[index] * Float(frames))
+                var firstPhase = phase[index]
+                var step = increment[index]
+                vDSP_vramp(&firstPhase, &step, phaseScratch + rows * frames, 1, length)
+                phase[index] = fmodf(firstPhase + step * Float(frames), twoPi)
+                amplitude[index] = end
+                rampStart[rows] = start
+                rampStep[rows] = (end - start) / Float(frames)
+                rows += 1
             }
-
-            level[voice] = envelope
-            transient[voice] = hammer
-            age[voice] = sampleAge
-            let fundamentalGone = amplitude[base] < 1e-4 && amplitude[base + 1] < 1e-4
-            if envelope < 1e-4 || fundamentalGone || sampleAge > Int32(sampleRate * 12) {
+            guard rows > 0 else {
                 active[voice] = false
+                continue
+            }
+            var count = Int32(rows * frames)
+            vvsinf(sineScratch, phaseScratch, &count)
+            vDSP_vclr(voiceScratch, 1, length)
+            for row in 0..<rows {
+                var start = rampStart[row]
+                var step = rampStep[row]
+                vDSP_vrampmuladd(sineScratch + row * frames, 1, &start, &step, voiceScratch, 1, length)
+            }
+            applyEnvelope(voice, from: voiceScratch, into: output, frames: frames)
+
+            guard active[voice] else { continue }
+            let fundamentalGone = amplitude[base] < 1e-4 && amplitude[base + 1] < 1e-4
+            if level[voice] < 1e-4 || fundamentalGone {
+                active[voice] = false
+            } else if age[voice] > maxAgeFrames {
+                beginFade(voice)
             }
         }
     }
 
+    /// Adds the voice's partials times its envelope. The envelope is ramped linearly between its exact
+    /// values at the ends of each stretch, split where the attack or a fade-out ends.
+    private func applyEnvelope(_ voice: Int, from source: UnsafeMutablePointer<Float>, into output: UnsafeMutablePointer<Float>, frames: Int) {
+        var offset = 0
+        while offset < frames {
+            var length = frames - offset
+            if age[voice] < attackFrames { length = min(length, Int(attackFrames - age[voice])) }
+            if fading[voice] { length = min(length, Int(fadeLeft[voice])) }
+            var start = envelope(voice)
+            advanceEnvelope(voice, by: length)
+            var step = (envelope(voice) - start) / Float(length)
+            vDSP_vrampmuladd(source + offset, 1, &start, &step, output + offset, 1, vDSP_Length(length))
+            offset += length
+            if fading[voice] && fadeLeft[voice] <= 0 {
+                active[voice] = false
+                return
+            }
+        }
+    }
+
+    private func envelope(_ voice: Int) -> Float {
+        let attack = age[voice] < attackFrames ? Float(age[voice]) / Float(attackFrames) : 1
+        let fade = fading[voice] ? Float(fadeLeft[voice]) / Float(fadeFrames) : 1
+        return voiceGain * level[voice] * attack * (1 + transient[voice]) * fade
+    }
+
+    private func advanceEnvelope(_ voice: Int, by frames: Int) {
+        let count = Float(frames)
+        age[voice] &+= Int32(frames)
+        if released[voice] { level[voice] *= expf(releaseRate[voice] * count) }
+        transient[voice] *= expf(transientRate[voice] * count)
+        if fading[voice] { fadeLeft[voice] -= Int32(frames) }
+    }
+
+    private func beginFade(_ voice: Int) {
+        guard active[voice], !fading[voice] else { return }
+        fading[voice] = true
+        fadeLeft[voice] = fadeFrames
+    }
+
+    /// How loud the voice is now, ignoring the attack ramp, so a note that just started isn't taken for a quiet one.
+    private func loudness(_ voice: Int) -> Float {
+        let base = voice * Self.partialCount
+        return level[voice] * (amplitude[base] + amplitude[base + 1])
+    }
+
     private func startVoice(_ midi: Int, velocity: Float) {
+        // A restruck key's old sound fades out under the new strike instead of jumping to silence.
+        var sounding = 0
+        for voice in 0..<slotCount where active[voice] && !fading[voice] {
+            if note[voice] == Int32(midi) { beginFade(voice) } else { sounding += 1 }
+        }
+        if sounding >= maxVoices {
+            var quietest = -1
+            var lowest = Float.infinity
+            for voice in 0..<slotCount where active[voice] && !fading[voice] && loudness(voice) < lowest {
+                lowest = loudness(voice)
+                quietest = voice
+            }
+            if quietest >= 0 {
+                beginFade(quietest)
+                sounding -= 1
+                statistics.voicesStolen += 1
+            }
+        }
         var slot = -1
-        for voice in 0..<maxVoices where active[voice] && note[voice] == Int32(midi) { slot = voice; break }
-        if slot < 0 { for voice in 0..<maxVoices where !active[voice] { slot = voice; break } }
+        for voice in 0..<slotCount where !active[voice] { slot = voice; break }
         if slot < 0 {
-            var oldest: Int32 = -1
-            for voice in 0..<maxVoices where age[voice] > oldest { oldest = age[voice]; slot = voice }
+            // Every slot is sounding or fading out: take over the fade closest to silence.
+            var shortest = Int32.max
+            for voice in 0..<slotCount where fading[voice] && fadeLeft[voice] < shortest {
+                shortest = fadeLeft[voice]
+                slot = voice
+            }
         }
         guard slot >= 0 else { return }
 
@@ -442,12 +580,14 @@ final class SynthCore: @unchecked Sendable {
 
         active[slot] = true
         released[slot] = false
+        fading[slot] = false
+        fadeLeft[slot] = 0
         note[slot] = Int32(midi)
         age[slot] = 0
         level[slot] = 1
-        releaseFactor[slot] = expf(-1 / (0.18 * sampleRate))
+        releaseRate[slot] = -1 / (0.18 * sampleRate)
         transient[slot] = 0.8 * velocity
-        transientFactor[slot] = expf(-1 / (0.05 * sampleRate))
+        transientRate[slot] = -1 / (0.05 * sampleRate)
 
         let base = slot * Self.partialCount
         for partial in 0..<Self.partialCount {
@@ -469,12 +609,61 @@ final class SynthCore: @unchecked Sendable {
             phase[index] = 0
             increment[index] = 2 * Float.pi * frequency / sampleRate
             amplitude[index] = amp
-            decay[index] = expf(-1 / (tau * sampleRate))
+            decayRate[index] = -1 / (tau * sampleRate)
         }
+        statistics.mostVoicesSounding = max(statistics.mostVoicesSounding, sounding + 1)
     }
 
     private func releaseVoices(_ midi: Int) {
-        for voice in 0..<maxVoices where active[voice] && note[voice] == Int32(midi) { released[voice] = true }
+        for voice in 0..<slotCount where active[voice] && !fading[voice] && note[voice] == Int32(midi) { released[voice] = true }
+    }
+
+    // MARK: Output limiter
+
+    /// Look-ahead peak limiter: the gain heads for what the loudest sample about to come out needs,
+    /// holds through the waveform's cycles and recovers slowly. A soft knee above the ceiling catches
+    /// any small overshoot, so the output never reaches full scale.
+    private func limit(_ output: UnsafeMutablePointer<Float>, frames: Int) {
+        let ceiling = Self.limiterCeiling
+        let lookahead = lookaheadFrames
+        var target = limiterTarget, gain = limiterGain, hold = holdLeft, index = delayIndex
+        var lowest = gain
+        for frame in 0..<frames {
+            let input = output[frame]
+            let magnitude = abs(input)
+            let needed = magnitude > ceiling ? ceiling / magnitude : 1
+            if needed <= target {
+                target = needed
+                hold = holdFrames
+            } else if hold > 0 {
+                hold -= 1
+            } else {
+                let recovered = 1 - (1 - target) * releaseCoefficient
+                if needed < recovered {
+                    target = needed
+                    hold = holdFrames
+                } else {
+                    target = recovered
+                }
+            }
+            gain = target < gain ? gain + (target - gain) * attackCoefficient : target
+            lowest = min(lowest, gain)
+
+            var sample = delayLine[index] * gain
+            delayLine[index] = input
+            index += 1
+            if index >= lookahead { index = 0 }
+            let peak = abs(sample)
+            if peak > ceiling {
+                sample = copysignf(ceiling + (1 - ceiling) * tanhf((peak - ceiling) / (1 - ceiling)), sample)
+            }
+            output[frame] = sample
+        }
+        limiterTarget = target
+        limiterGain = gain
+        holdLeft = hold
+        delayIndex = index
+        if lowest < statistics.lowestLimiterGain { statistics.lowestLimiterGain = lowest }
     }
 
     // MARK: Metronome clicks
