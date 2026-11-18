@@ -1,0 +1,112 @@
+import SwiftUI
+
+struct SettingsView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var connectionStatus: String?
+
+    var body: some View {
+        @Bindable var model = model
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Note names", selection: $model.notation) {
+                        ForEach(NotationSystem.allCases) { system in
+                            Text("\(system.title) (\(system.sample))").tag(system)
+                        }
+                    }
+                    Picker("Indian system for the toggle", selection: $model.indianSystem) {
+                        Text("Carnatic (Ri1 Ri2 Ga2 …)").tag(NotationSystem.carnatic)
+                        Text("Hindustani (komal / tivra)").tag(NotationSystem.hindustani)
+                    }
+                    Picker("Sa (tonic)", selection: $model.saPitchClass) {
+                        ForEach(0..<12, id: \.self) { Text(MIDINote.keyNames[$0]).tag($0) }
+                    }
+                    Picker("Labels on keys", selection: $model.keyLabelMode) {
+                        ForEach(KeyLabelMode.allCases) { Text($0.title).tag($0) }
+                    }
+                } header: {
+                    Text("Notation")
+                } footer: {
+                    Text(notationFooter)
+                }
+
+                Section {
+                    Toggle("Show finger numbers", isOn: $model.showFingerNumbers)
+                    Toggle("App plays the other hand", isOn: $model.playOtherHand)
+                    Toggle("Metronome", isOn: $model.metronomeEnabled)
+                    Stepper(value: Binding(get: { model.lesson.tempoScale }, set: { model.setTempoScale($0) }), in: 0.25...1.5, step: 0.05) {
+                        LabeledContent("Speed", value: "\(Int((model.lesson.tempoScale * 100).rounded()))%")
+                    }
+                } header: {
+                    Text("Lesson")
+                } footer: {
+                    Text("In Tempo and Listen mode the app plays the hand you aren't practising, softer. The speed applies to Tempo, Listen and the metronome, which accents the first beat of each bar.")
+                }
+
+                Section {
+                    Toggle("Accept the right note in any octave", isOn: $model.micOctaveTolerant)
+                    LabeledContent("Permission", value: model.mic.permissionDescription)
+                } header: {
+                    Text("Microphone")
+                } footer: {
+                    Text("Single notes are recognised with YIN pitch detection; chords in both-hands mode use a 12-tone chroma match. Keys tapped on screen always count.")
+                }
+
+                Section("Keyboard & sound") {
+                    Toggle("Play sound", isOn: $model.soundEnabled)
+                    Stepper(value: $model.visibleWhiteKeys, in: 8...36) {
+                        LabeledContent("Visible white keys", value: "\(model.visibleWhiteKeys)")
+                    }
+                    Toggle("Zoom out to fit each song", isOn: $model.autoZoom)
+                }
+
+                Section {
+                    Toggle("Import photos and PDFs", isOn: $model.recognitionEnabled)
+                        .accessibilityIdentifier("recognitionToggle")
+                    if model.recognitionEnabled {
+                        TextField("Server URL, e.g. https://omr.example.com", text: $model.recognitionServerURL)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("recognitionURL")
+                        SecureField("Access token", text: $model.recognitionToken)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("recognitionToken")
+                        Button {
+                            connectionStatus = "Checking…"
+                            Task { connectionStatus = await model.checkRecognitionServer() }
+                        } label: {
+                            Label("Test connection", systemImage: "antenna.radiowaves.left.and.right")
+                        }
+                        .disabled(model.recognitionServerURL.isEmpty)
+                        if let connectionStatus {
+                            Text(connectionStatus).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Sheet music recognition")
+                } footer: {
+                    Text("Photos and PDFs of printed piano music are uploaded to your recognition server (the flowy-piano OMR server), which returns MusicXML. The token is stored in the Keychain.")
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+    }
+
+    private var notationFooter: String {
+        switch model.notation {
+        case .western:
+            return "Letter names with octave numbers on C (C4 = middle C)."
+        case .carnatic:
+            return "Carnatic swaras with variant numbers. Enharmonic names (Ri3/Ga2, Ga1/Ri2, Da3/Ni2, Ni1/Da2) follow the score's spelling. A dot above means the upper octave, below means the lower octave."
+        case .hindustani:
+            return "Komal swaras are underlined and tivra Ma has a stroke above. A dot above means the upper octave, below means the lower octave."
+        }
+    }
+}
