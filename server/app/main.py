@@ -81,7 +81,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         yield
         manager.stop()
 
-    app = FastAPI(title="rochan-piano OMR server", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="flowy-piano OMR server", version="1.0.0", lifespan=lifespan)
     app.state.manager = manager
     # multipart framing adds a little on top of the files themselves
     app.add_middleware(UploadLimit, max_bytes=settings.max_upload_bytes + 256 * 1024)

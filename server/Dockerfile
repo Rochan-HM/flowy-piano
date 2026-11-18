@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
 # OMR server: FastAPI + homr (CPU). Model weights are downloaded during the build, not committed.
-#   docker build -t rochan-piano-omr server/
-#   docker run -p 8000:8000 -e OMR_API_TOKEN=change-me rochan-piano-omr
+#   docker build -t flowy-piano-omr server/
+#   docker run -p 8000:8000 -e OMR_API_TOKEN=change-me flowy-piano-omr
 
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 

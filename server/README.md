@@ -12,8 +12,8 @@ project report `docs/sheet-music-recognition.md` for the comparison with copiste
 ## Run
 
 ```sh
-docker build -t rochan-piano-omr server/
-docker run -p 8000:8000 -e OMR_API_TOKEN=change-me rochan-piano-omr
+docker build -t flowy-piano-omr server/
+docker run -p 8000:8000 -e OMR_API_TOKEN=change-me flowy-piano-omr
 curl localhost:8000/healthz
 curl -H "Authorization: Bearer change-me" -F file=@server/testdata/pieces/mutopia-burgmuller-arabesque/photo-hard.jpg \
   "localhost:8000/v1/jobs?wait=30"
