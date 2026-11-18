@@ -66,7 +66,7 @@ enum RecognitionError: LocalizedError, Equatable {
     }
 }
 
-/// Client for the rochan-piano recognition server (`server/` in the repository):
+/// Client for the flowy-piano recognition server (`server/` in the repository):
 /// `POST /v1/jobs?wait=30` → long-poll `GET /v1/jobs/{id}?wait=30` → `GET /v1/jobs/{id}/musicxml`.
 struct RecognitionClient: Sendable {
     var baseURL: URL

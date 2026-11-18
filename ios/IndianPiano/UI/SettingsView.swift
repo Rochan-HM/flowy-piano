@@ -88,7 +88,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Sheet music recognition")
                 } footer: {
-                    Text("Photos and PDFs of printed piano music are uploaded to your recognition server (the rochan-piano OMR server), which returns MusicXML. The token is stored in the Keychain.")
+                    Text("Photos and PDFs of printed piano music are uploaded to your recognition server (the flowy-piano OMR server), which returns MusicXML. The token is stored in the Keychain.")
                 }
             }
             .navigationTitle("Settings")
