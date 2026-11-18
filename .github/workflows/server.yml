@@ -24,10 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: docker build -t rochan-piano-omr server/
+      - run: docker build -t flowy-piano-omr server/
       - name: Smoke test
         run: |
-          docker run -d --name omr -p 8000:8000 -e OMR_API_TOKEN=ci-token rochan-piano-omr
+          docker run -d --name omr -p 8000:8000 -e OMR_API_TOKEN=ci-token flowy-piano-omr
           for i in $(seq 1 30); do curl -sf localhost:8000/healthz && break; sleep 2; done
           curl -sf -H "Authorization: Bearer ci-token" \
             -F file=@server/testdata/pieces/mutopia-bach-minuet-g/photo-hard.jpg \
