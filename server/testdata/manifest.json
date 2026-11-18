@@ -1,0 +1,95 @@
+{
+  "description": "Public-domain piano scores for end-to-end OMR tests. See README.md for sources and licenses.",
+  "pieces": [
+    {
+      "id": "mutopia-bach-minuet-g",
+      "title": "Minuet in G major, BWV Anh. 114",
+      "composer": "Christian Petzold (attr. J. S. Bach)",
+      "kind": "engraved",
+      "printed_fingering": false,
+      "pdf_pages": 1,
+      "truth_pages": [{"page": 1, "truth": ["truth.mid"]}],
+      "expect": {"staves": 2, "measures": 32}
+    },
+    {
+      "id": "mutopia-burgmuller-la-candeur",
+      "title": "La Candeur, Op. 100 No. 1",
+      "composer": "J. F. F. Burgmüller",
+      "kind": "engraved",
+      "printed_fingering": true,
+      "pdf_pages": 1,
+      "truth_pages": [{"page": 1, "truth": ["truth.mid"]}],
+      "expect": {"staves": 2, "measures": 23}
+    },
+    {
+      "id": "mutopia-burgmuller-arabesque",
+      "title": "L'Arabesque, Op. 100 No. 2",
+      "composer": "J. F. F. Burgmüller",
+      "kind": "engraved",
+      "printed_fingering": true,
+      "pdf_pages": 1,
+      "truth_pages": [{"page": 1, "truth": ["truth.mid"]}],
+      "expect": {"staves": 2, "measures": 33}
+    },
+    {
+      "id": "mutopia-clementi-op36-1",
+      "title": "Sonatina in C major, Op. 36 No. 1 (three movements)",
+      "composer": "Muzio Clementi",
+      "kind": "engraved",
+      "printed_fingering": false,
+      "pdf_pages": 3,
+      "truth_pages": [
+        {"page": 1, "truth": ["truth-mvt1.mid"]},
+        {"page": 2, "truth": ["truth-mvt2.mid"]},
+        {"page": 3, "truth": ["truth-mvt3.mid"]}
+      ],
+      "expect": {"staves": 2, "measures": 134}
+    },
+    {
+      "id": "scan-burgmuller-arabesque-schirmer-1903",
+      "title": "L'Arabesque, Op. 100 No. 2 (Schirmer 1903 scan)",
+      "composer": "J. F. F. Burgmüller",
+      "kind": "scan",
+      "printed_fingering": true,
+      "pdf_pages": 1,
+      "truth_pages": [{"page": 1, "truth": ["truth.mid"]}],
+      "truth_note": "Truth is the Mutopia engraving of the Litolff edition: same notes, different fingering and layout.",
+      "expect": {"staves": 2, "measures": 33}
+    },
+    {
+      "id": "scan-clementi-op36-1-schirmer-1893",
+      "title": "Sonatina in C major, Op. 36 No. 1, first movement (Schirmer 1893 scan)",
+      "composer": "Muzio Clementi",
+      "kind": "scan",
+      "printed_fingering": true,
+      "pdf_pages": 1,
+      "truth_pages": [{"page": 1, "truth": ["truth.mid"]}],
+      "truth_note": "Truth is Mutopia's engraving of this same Schirmer edition (fingering not transcribed).",
+      "expect": {"staves": 2, "measures": 38}
+    },
+    {
+      "id": "musescore-beethoven-fur-elise-fingered",
+      "title": "Für Elise, WoO 59, bars 1-40 (fingered)",
+      "composer": "L. van Beethoven",
+      "kind": "musescore-render",
+      "printed_fingering": true,
+      "pdf_pages": 2,
+      "truth_pages": [
+        {"page": 1, "truth": ["truth.musicxml"], "measures": [1, 30]},
+        {"page": 2, "truth": ["truth.musicxml"], "measures": [31, 40]}
+      ],
+      "expect": {"staves": 2, "measures": 40}
+    }
+  ],
+  "real_photos": [
+    {
+      "id": "goodbye-dear-old-canada-1915",
+      "title": "Goodbye Dear Old Canada (song, voice and piano)",
+      "composer": "Marjorie W. Henry",
+      "files": ["scan.pdf", "photo-01.jpg", "photo-07.jpg"],
+      "reference": "reference-unverified.musicxml",
+      "reference_note": "homr's reading of the clean scan, not checked by a person: use for structure and agreement checks only.",
+      "expect": {"staves": 3}
+    }
+  ]
+}
