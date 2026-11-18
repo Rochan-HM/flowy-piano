@@ -1,4 +1,4 @@
-# rochan-piano
+# flowy-piano
 
 A piano learning app that teaches with Western (C D E) or Indian Carnatic sargam (Sa Ri Ga) notation.
 
